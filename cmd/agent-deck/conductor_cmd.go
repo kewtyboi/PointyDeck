@@ -257,6 +257,7 @@ func handleConductorSetup(profile string, args []string) {
 	telegramConfigured := settings.Telegram.Token != ""
 	slackConfigured := settings.Slack.BotToken != ""
 	discordConfigured := settings.Discord.BotToken != ""
+	mattermostConfigured := settings.Mattermost.URL != ""
 
 	// v1.7.22: warn on the "global telegram enabled in profile settings.json"
 	// anti-pattern that silently leaks pollers to every claude session under
@@ -289,7 +290,7 @@ func handleConductorSetup(profile string, args []string) {
 		fmt.Println("monitor and orchestrate all your agent-deck sessions.")
 		fmt.Println()
 		fmt.Println("Conductors work locally by default — interact via the TUI or CLI.")
-		fmt.Println("You can optionally connect remote channels (Telegram, Slack, Discord)")
+		fmt.Println("You can optionally connect remote channels (Telegram, Slack, Discord, Mattermost)")
 		fmt.Println("for mobile and remote access.")
 		fmt.Println()
 	}
@@ -297,7 +298,7 @@ func handleConductorSetup(profile string, args []string) {
 	// Step 2b: Offer channel configuration for any unconfigured channels.
 	// Runs on first setup and on re-runs, so users can add channels later.
 	// Skipped in --json mode: interactive prompts would hang on stdin.
-	if !*jsonOutput && (!telegramConfigured || !slackConfigured || !discordConfigured) {
+	if !*jsonOutput && (!telegramConfigured || !slackConfigured || !discordConfigured || !mattermostConfigured) {
 		reader := bufio.NewReader(os.Stdin)
 
 		fmt.Print("Add remote channels for mobile/remote access? (y/N): ")
@@ -439,6 +440,52 @@ func handleConductorSetup(profile string, args []string) {
 				}
 			}
 
+			if !mattermostConfigured {
+				fmt.Print("Connect Mattermost bot for channel-based control? (y/N): ")
+				mmAnswer, _ := reader.ReadString('\n')
+				mmAnswer = strings.TrimSpace(strings.ToLower(mmAnswer))
+
+				if yesAnswer(mmAnswer) {
+					fmt.Println()
+					fmt.Println("  1. Log in to Mattermost as a system admin")
+					fmt.Println("  2. System Console -> Integrations -> Bot Accounts -> Enable Bot Account Creation")
+					fmt.Println("  3. Integrations -> Bot Accounts -> Add Bot Account -> copy the access token")
+					fmt.Println("  4. Invite the bot to your channel")
+					fmt.Println()
+
+					fmt.Print("Mattermost server URL (e.g. http://localhost:8065): ")
+					mmURL, _ := reader.ReadString('\n')
+					mmURL = strings.TrimSpace(mmURL)
+					if mmURL == "" {
+						fmt.Fprintln(os.Stderr, "Error: server URL is required")
+						os.Exit(1)
+					}
+
+					fmt.Print("Mattermost bot access token: ")
+					mmToken, _ := reader.ReadString('\n')
+					mmToken = strings.TrimSpace(mmToken)
+					if mmToken == "" {
+						fmt.Fprintln(os.Stderr, "Error: bot access token is required")
+						os.Exit(1)
+					}
+
+					fmt.Print("Mattermost team slug: ")
+					mmTeam, _ := reader.ReadString('\n')
+					mmTeam = strings.TrimSpace(mmTeam)
+
+					fmt.Print("Mattermost channel ID: ")
+					mmChannelID, _ := reader.ReadString('\n')
+					mmChannelID = strings.TrimSpace(mmChannelID)
+					if mmChannelID == "" {
+						fmt.Fprintln(os.Stderr, "Error: channel ID is required")
+						os.Exit(1)
+					}
+
+					settings.Mattermost = session.MattermostSettings{URL: mmURL, Token: mmToken, Team: mmTeam, ChannelID: mmChannelID}
+					configChanged = true
+				}
+			}
+
 			if configChanged {
 				if settings.HeartbeatInterval == nil {
 					heartbeatDefault := 15
@@ -449,6 +496,7 @@ func handleConductorSetup(profile string, args []string) {
 				telegramConfigured = settings.Telegram.Token != ""
 				slackConfigured = settings.Slack.BotToken != ""
 				discordConfigured = settings.Discord.BotToken != ""
+				mattermostConfigured = settings.Mattermost.URL != ""
 
 				if err := session.SaveUserConfig(config); err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving config: %v\n", err)
@@ -601,7 +649,7 @@ func handleConductorSetup(profile string, args []string) {
 
 	// Step 7: Install bridge (if Telegram, Slack, or Discord is configured)
 	var plistPath string
-	if telegramConfigured || slackConfigured || discordConfigured {
+	if telegramConfigured || slackConfigured || discordConfigured || mattermostConfigured {
 		if !*jsonOutput {
 			fmt.Println()
 			fmt.Println("Installing bridge...")
@@ -667,6 +715,7 @@ func handleConductorSetup(profile string, args []string) {
 			"telegram":                telegramConfigured,
 			"slack":                   slackConfigured,
 			"discord":                 discordConfigured,
+			"mattermost":              mattermostConfigured,
 			"notifier_daemon_running": session.IsTransitionNotifierDaemonRunning(),
 		}
 		if plistPath != "" {
@@ -692,7 +741,7 @@ func handleConductorSetup(profile string, args []string) {
 	}
 	fmt.Println()
 	fmt.Println("Next steps:")
-	if telegramConfigured || slackConfigured || discordConfigured {
+	if telegramConfigured || slackConfigured || discordConfigured || mattermostConfigured {
 		condDir, _ := session.ConductorDir()
 		fmt.Printf("  agent-deck -p %s session start %s\n", resolvedProfile, sessionTitle)
 		fmt.Println()
@@ -704,6 +753,9 @@ func handleConductorSetup(profile string, args []string) {
 		}
 		if discordConfigured {
 			fmt.Println("  Test from Discord: post a message in the configured channel or use /ad-status")
+		}
+		if mattermostConfigured {
+			fmt.Println("  Test from Mattermost: post a message in the configured channel")
 		}
 		fmt.Printf("  View bridge logs:   tail -f %s/bridge.log\n", condDir)
 	} else {
@@ -1341,11 +1393,14 @@ func installPythonDeps() bool {
 		if config.Conductor.Discord.BotToken != "" {
 			packages = append(packages, "discord.py")
 		}
+		if config.Conductor.Mattermost.URL != "" {
+			packages = append(packages, "mattermostautodriver")
+		}
 	}
 
 	// Fallback: if no specific integration detected, install all
 	if len(packages) == 1 {
-		packages = append(packages, "aiogram", "slack-bolt", "slack-sdk", "aiohttp", "discord.py")
+		packages = append(packages, "aiogram", "slack-bolt", "slack-sdk", "aiohttp", "discord.py", "mattermostautodriver")
 	}
 
 	// Try with --user first; fall back to no --user (venvs, containers).
