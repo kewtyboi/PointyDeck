@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Conductor Bridge: Telegram & Slack & Discord <-> Agent-Deck conductor sessions (multi-conductor).
+Conductor Bridge: Telegram & Slack & Discord & Mattermost <-> Agent-Deck conductor sessions (multi-conductor).
 
 A thin bridge that:
-  A) Forwards Telegram/Slack/Discord messages -> conductor session (via agent-deck CLI)
-  B) Forwards conductor responses -> Telegram/Slack/Discord
+  A) Forwards Telegram/Slack/Discord/Mattermost messages -> conductor session (via agent-deck CLI)
+  B) Forwards conductor responses -> Telegram/Slack/Discord/Mattermost
   C) Runs a periodic heartbeat to trigger conductor status checks
 
 Discovers conductors dynamically from meta.json files in ~/.agent-deck/conductor/*/
 Each conductor has its own name, profile, and heartbeat settings.
 
-Dependencies: pip3 install toml aiogram slack-bolt slack-sdk discord.py
+Dependencies: pip3 install toml aiogram slack-bolt slack-sdk discord.py mattermostautodriver
   - aiogram is only needed if Telegram is configured
   - slack-bolt/slack-sdk are only needed if Slack is configured
   - discord.py is only needed if Discord is configured
+  - mattermostautodriver is only needed if Mattermost is configured
 """
 
 from __future__ import annotations
@@ -60,6 +61,13 @@ try:
     HAS_DISCORD = True
 except ImportError:
     HAS_DISCORD = False
+
+# Conditional imports for Mattermost
+try:
+    from mattermostautodriver import AsyncTypedDriver
+    HAS_MATTERMOST = True
+except ImportError:
+    HAS_MATTERMOST = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -125,6 +133,61 @@ CONFIG_PATH = resolve_config_path("config.toml")
 # --- end issue #1350 resolver ---
 LOG_PATH = CONDUCTOR_DIR / "bridge.log"
 
+# Operator-observable Mattermost health. The Go CLI (agent-deck conductor
+# status) has no IPC channel to this standalone Python process, so the bridge
+# writes its websocket health here atomically and the CLI reads it best-effort.
+MATTERMOST_STATUS_PATH = CONDUCTOR_DIR / "mattermost-status.json"
+
+
+def _now_iso() -> str:
+    """UTC timestamp in RFC3339/ISO-8601 form (matches the Go CLI formatting)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def write_mattermost_status(status: dict) -> None:
+    """Atomically persist the Mattermost bridge health status for the Go CLI.
+
+    Best-effort: a failure to write health must never take down the bridge.
+    """
+    try:
+        MATTERMOST_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MATTERMOST_STATUS_PATH.with_name(MATTERMOST_STATUS_PATH.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(status, fh)
+        os.replace(tmp, MATTERMOST_STATUS_PATH)
+    except Exception as exc:
+        log.debug("Mattermost: could not write status file: %s", exc)
+
+
+def mattermost_is_authorized(
+    user_id: str,
+    allowed_users,
+    allow_all_dev: bool = False,
+) -> bool:
+    """Fail-closed Mattermost authorisation decision (pure, importable for tests).
+
+    - Non-empty allow-list: only listed users are accepted.
+    - Empty allow-list + allow_all_dev: accept all (dev escape hatch), WARN.
+    - Empty allow-list (hardened default): reject all inbound input.
+    """
+    if allowed_users:
+        if user_id not in allowed_users:
+            log.warning("Unauthorised Mattermost message from user %s", user_id)
+            return False
+        return True
+    if allow_all_dev:
+        log.warning(
+            "Mattermost DEV MODE: accepting input from unlisted user %s "
+            "(allow_all_users_for_dev=true); set allowed_user_ids for production",
+            user_id,
+        )
+        return True
+    log.warning(
+        "Mattermost message refused: allowed_user_ids is empty (hardened default "
+        "denies all inbound input). Set allowed_user_ids to enable."
+    )
+    return False
+
 # Telegram message length limit
 TG_MAX_LENGTH = 4096
 
@@ -133,6 +196,9 @@ SLACK_MAX_LENGTH = 40000
 
 # Discord message length limit
 DISCORD_MAX_LENGTH = 2000
+
+# Mattermost message length limit
+MATTERMOST_MAX_LENGTH = 16383
 
 # Marker for uploading local images through the Discord bridge.
 IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(?P<path>[^\]]+)\]")
@@ -256,10 +322,24 @@ def load_config() -> dict:
     dc_ignore_replies_to_others = dc.get("ignore_replies_to_others", False)
     dc_configured = bool(dc_bot_token and dc_guild_id and dc_channel_id and dc_user_id)
 
-    if not tg_configured and not sl_configured and not dc_configured:
+    # Mattermost config
+    mm = conductor_cfg.get("mattermost", {})
+    mm_url = mm.get("url", "")
+    mm_token = _resolve_secret(mm.get("token", ""))
+    mm_team = mm.get("team", "")
+    mm_channel_id = mm.get("channel_id", "")
+    mm_allowed_users = mm.get("allowed_user_ids", [])
+    # Dev-only escape hatch: when no allow-list is set the bridge is
+    # fail-closed (all inbound input refused) UNLESS this is explicitly
+    # enabled. Never set in production - it accepts commands from any
+    # Mattermost user in the channel.
+    mm_allow_all_dev = bool(mm.get("allow_all_users_for_dev", False))
+    mm_configured = bool(mm_url and mm_token and mm_channel_id)
+
+    if not tg_configured and not sl_configured and not dc_configured and not mm_configured:
         log.error(
             "No messaging platform configured in config.toml. "
-            "Set [conductor.telegram], [conductor.slack], or [conductor.discord]."
+            "Set [conductor.telegram], [conductor.slack], [conductor.discord], or [conductor.mattermost]."
         )
         sys.exit(1)
 
@@ -285,6 +365,15 @@ def load_config() -> dict:
             "listen_mode": dc_listen_mode,
             "ignore_replies_to_others": bool(dc_ignore_replies_to_others),
             "configured": dc_configured,
+        },
+        "mattermost": {
+            "url": mm_url,
+            "token": mm_token,
+            "team": mm_team,
+            "channel_id": mm_channel_id,
+            "allowed_user_ids": mm_allowed_users,
+            "allow_all_users_for_dev": mm_allow_all_dev,
+            "configured": mm_configured,
         },
         "heartbeat_interval": conductor_cfg.get("heartbeat_interval", 15),
     }
@@ -2568,6 +2657,340 @@ def create_discord_bot(config: dict):
 
 
 # ---------------------------------------------------------------------------
+# Mattermost bridge setup
+# ---------------------------------------------------------------------------
+
+
+def create_mattermost_bridge(config: dict):
+    """Create and configure the Mattermost bridge.
+
+    Uses the Mattermost WebSocket API for inbound events and the REST API
+    (via mattermostautodriver AsyncTypedDriver) for outbound messages.
+    No Socket Mode needed: auth is a plain bot access token (Bearer).
+
+    Returns (driver, channel_id, websocket_runner) or None if Mattermost is not configured
+    or mattermostautodriver is not available. websocket_runner is a callable that starts
+    the WebSocket event loop, or None if the WebSocket could not be initialised.
+    """
+    if not HAS_MATTERMOST:
+        log.warning("mattermostautodriver not installed, skipping Mattermost bridge")
+        return None
+    if not config["mattermost"]["configured"]:
+        return None
+
+    mm_cfg = config["mattermost"]
+    raw_url = mm_cfg["url"].rstrip("/")
+    token = mm_cfg["token"]
+    channel_id = mm_cfg["channel_id"]
+    allowed_users = mm_cfg["allowed_user_ids"]
+    allow_all_dev = mm_cfg.get("allow_all_users_for_dev", False)
+
+    # Mutable health snapshot persisted to MATTERMOST_STATUS_PATH on changes.
+    mm_status = {
+        "websocket": "disconnected",
+        "connected": False,
+        "last_successful_auth": "",
+        "last_event_time": "",
+        "last_error": "",
+    }
+
+    def _update_status(**changes) -> None:
+        mm_status.update(changes)
+        write_mattermost_status(mm_status)
+
+    # Parse scheme + host + optional port from the configured URL
+    import urllib.parse as _urlparse
+    parsed = _urlparse.urlparse(raw_url if "://" in raw_url else f"http://{raw_url}")
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if scheme == "https" else 8065)
+
+    driver = AsyncTypedDriver({
+        "url": host,
+        "token": token,
+        "scheme": scheme,
+        "port": port,
+    })
+
+    def is_mm_authorized(user_id: str) -> bool:
+        """Fail-closed authorisation (delegates to mattermost_is_authorized)."""
+        return mattermost_is_authorized(user_id, allowed_users, allow_all_dev)
+
+    async def _mm_post(text: str) -> None:
+        """Post a message to the configured Mattermost channel, splitting if needed."""
+        for chunk in split_message(text, max_len=MATTERMOST_MAX_LENGTH):
+            try:
+                await driver.posts.create_post(channel_id=channel_id, message=chunk)
+            except Exception as exc:
+                log.error("Mattermost post failed: %s", exc)
+
+    async def _mm_event_handler(raw_event) -> None:
+        """Handle inbound Mattermost WebSocket events.
+
+        mattermostautodriver passes raw JSON strings to the event handler.
+        """
+        import json as _json
+        try:
+            if isinstance(raw_event, str):
+                event = _json.loads(raw_event)
+            else:
+                event = raw_event
+        except Exception as exc:
+            log.warning("Mattermost: failed to parse WebSocket message: %s", exc)
+            return
+
+        event_type = event.get("event", "")
+        if event_type != "posted":
+            return
+
+        try:
+            data = event.get("data", {})
+            post_raw = data.get("post", "{}")
+            if isinstance(post_raw, str):
+                post = _json.loads(post_raw)
+            else:
+                post = post_raw
+        except Exception as exc:
+            log.warning("Mattermost: failed to parse post payload: %s", exc)
+            return
+
+        # Ignore posts not in the configured channel
+        if post.get("channel_id") != channel_id:
+            return
+
+        _update_status(last_event_time=_now_iso())
+
+        # Ignore the bot's own posts (user_id matches the driver's own user)
+        own_user_id = getattr(driver, "_user_id", None)
+        sender_id = post.get("user_id", "")
+        if own_user_id and sender_id == own_user_id:
+            return
+
+        # Authorisation gate
+        if not is_mm_authorized(sender_id):
+            return
+
+        text = post.get("message", "").strip()
+        if not text:
+            return
+
+        log.info("Mattermost message from %s (%d chars)", sender_id, len(text))
+
+        conductor_names = get_conductor_names()
+        conductors = discover_conductors()
+        target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
+
+        target = None
+        if target_name:
+            for c in conductors:
+                if c["name"] == target_name:
+                    target = c
+                    break
+        if target is None:
+            target = get_default_conductor()
+        if target is None:
+            await _mm_post("[No conductors configured. Run: agent-deck conductor setup <name>]")
+            return
+
+        if not cleaned_msg:
+            cleaned_msg = text
+
+        session_title = conductor_session_title(target["name"])
+        profile = target["profile"]
+
+        # Run pre-message hook (can transform or gate the message)
+        hook_result = invoke_hook(profile, "pre-message", {
+            "profile": profile,
+            "message_text": cleaned_msg,
+            "user_id": sender_id,
+        })
+        if hook_result is not None:
+            success, stdout = hook_result
+            if not success:
+                log.info("Mattermost: message dropped by pre-message hook for [%s]", profile)
+                return
+            if stdout:
+                cleaned_msg = stdout
+
+        if not await ensure_conductor_running(target["name"], profile):
+            await _mm_post(f"[Could not start conductor {target['name']}. Check agent-deck.]")
+            return
+
+        loop = asyncio.get_running_loop()
+        conductor_status = await loop.run_in_executor(
+            None, functools.partial(get_session_status, session_title, profile=profile)
+        )
+        was_busy = conductor_status in ("running", "active", "starting")
+        name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
+
+        if was_busy:
+            enqueued_at = time.monotonic()
+
+            async def _mm_reply(response_text: str) -> None:
+                elapsed = int(time.monotonic() - enqueued_at)
+                waited = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+                header = (
+                    f"{name_tag}Queued response (waited {waited}):\n"
+                    if name_tag else f"Queued response (waited {waited}):\n"
+                )
+                await _mm_post(f"{header}{response_text}")
+
+            ok, _, _ = send_to_conductor(
+                session_title, cleaned_msg, profile=profile,
+                wait_for_reply=False, reply_callback=_mm_reply,
+                force_queue=True,
+            )
+            if not ok:
+                await _mm_post(f"[Failed to send message to conductor {target['name']}.]")
+                return
+            await _mm_post(
+                f"{name_tag}⏳ Conductor busy - message queued, will reply here when done."
+            )
+            return
+
+        await _mm_post(f"{name_tag}⏳")
+        wait_started_at = time.monotonic()
+        ok, response, still_running = await loop.run_in_executor(
+            None,
+            functools.partial(
+                send_to_conductor,
+                session_title, cleaned_msg, profile=profile,
+                wait_for_reply=True, response_timeout=RESPONSE_TIMEOUT,
+            ),
+        )
+        if not ok:
+            if still_running:
+                async def _mm_late_reply(response_text: str) -> None:
+                    elapsed = int(time.monotonic() - wait_started_at)
+                    waited = f"{elapsed // 60}m {elapsed % 60}s" if elapsed >= 60 else f"{elapsed}s"
+                    header = (
+                        f"{name_tag}Queued response (waited {waited}):\n"
+                        if name_tag else f"Queued response (waited {waited}):\n"
+                    )
+                    await _mm_post(f"{header}{response_text}")
+
+                _register_pending_reply(session_title, profile, _mm_late_reply)
+                await _mm_post(f"{name_tag}⏳ Still working - will reply here when done.")
+                return
+            await _mm_post(f"[Failed to send message to conductor {target['name']}.]")
+            return
+
+        log.info("Conductor [%s] Mattermost response (%d chars)", target["name"], len(response))
+        for chunk in split_message(response, max_len=MATTERMOST_MAX_LENGTH):
+            prefixed = f"{name_tag}{chunk}" if name_tag else chunk
+            await _mm_post(prefixed)
+
+        invoke_hook(profile, "post-message", {
+            "profile": profile,
+            "message_text": cleaned_msg,
+            "response": response,
+        })
+
+    async def _ensure_own_user_id() -> None:
+        """Fetch and cache the bot's own user_id for self-post filtering.
+
+        Retried on every (re)connect: a missing id would let the bot echo its
+        own posts back into the conductor (latent self-loop bug).
+        """
+        if getattr(driver, "_user_id", ""):
+            return
+        try:
+            me = await driver.users.get_user("me")
+            driver._user_id = me.get("id", "")
+        except Exception as exc:
+            driver._user_id = ""
+            log.warning("Mattermost: could not fetch own user_id: %s", exc)
+        if getattr(driver, "_user_id", ""):
+            log.info("Mattermost bot user_id: %s", driver._user_id)
+        else:
+            log.warning(
+                "Mattermost: own user_id unknown - self-post filtering is "
+                "disabled until it can be fetched (echo-loop risk)"
+            )
+
+    async def _run_websocket() -> None:
+        """Authenticate and run the listener with capped-backoff reconnect.
+
+        Mirrors the Slack reconnect pattern: exponential backoff to 60s, reset
+        on a successful (re)connect, and suppressed repeated-failure log spam
+        so a downed Mattermost server does not flood the bridge log.
+        """
+        backoff = 1
+        max_backoff = 60
+        consecutive_failures = 0
+        _update_status(websocket="connecting", connected=False)
+        while True:
+            try:
+                await driver.login()
+                await _ensure_own_user_id()
+                log.info("Mattermost WebSocket connecting to %s:%s", host, port)
+                # Successful auth: reset backoff and publish healthy status.
+                backoff = 1
+                consecutive_failures = 0
+                _update_status(
+                    websocket="connected",
+                    connected=True,
+                    last_successful_auth=_now_iso(),
+                    last_error="",
+                )
+                # Returns when the socket closes; treated as a reconnect trigger.
+                await driver.init_websocket(_mm_event_handler)
+                _update_status(websocket="disconnected", connected=False)
+                log.warning(
+                    "Mattermost WebSocket closed; reconnecting in %ds", backoff
+                )
+            except asyncio.CancelledError:
+                _update_status(websocket="disconnected", connected=False)
+                raise
+            except Exception as exc:
+                consecutive_failures += 1
+                _update_status(
+                    websocket="disconnected",
+                    connected=False,
+                    last_error=str(exc)[:200],
+                )
+                # Log the first few failures, then every 10th, to bound spam.
+                if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
+                    log.warning(
+                        "Mattermost WebSocket error (failure #%d): %s; "
+                        "retrying in %ds",
+                        consecutive_failures, exc, backoff,
+                    )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    # Fail-closed startup gate: a configured bridge with no allow-list (and no
+    # dev override) accepts NO inbound input. Disable the listener cleanly so
+    # the rest of the multi-bridge process (Slack/Telegram/Discord) keeps
+    # running; outbound notifications via the driver still work.
+    input_enabled = bool(allowed_users) or allow_all_dev
+    if not input_enabled:
+        log.warning(
+            "Mattermost INPUT DISABLED (hardened default): bridge is configured "
+            "but [conductor.mattermost].allowed_user_ids is empty and "
+            "allow_all_users_for_dev is not set. Inbound commands are refused "
+            "until you set allowed_user_ids; outbound notifications still work."
+        )
+        _update_status(websocket="input_disabled", connected=False)
+        log.info(
+            "Mattermost bridge initialised (channel=%s, input disabled)",
+            channel_id,
+        )
+        return driver, channel_id, None
+
+    if allow_all_dev and not allowed_users:
+        log.warning(
+            "Mattermost DEV MODE active: allow_all_users_for_dev=true - the "
+            "bridge will accept inbound commands from ANY user in the channel. "
+            "Do not use this in production; set allowed_user_ids instead."
+        )
+
+    _update_status(websocket="disconnected", connected=False)
+    log.info("Mattermost bridge initialised (channel=%s)", channel_id)
+    return driver, channel_id, _run_websocket
+
+
+# ---------------------------------------------------------------------------
 # Heartbeat loop
 # ---------------------------------------------------------------------------
 
@@ -2596,6 +3019,7 @@ def _os_heartbeat_daemon_installed() -> bool:
 async def heartbeat_loop(
     config: dict, telegram_bot=None, slack_app=None, slack_channel_id=None,
     discord_bot=None, discord_channel_id=None,
+    mm_post_fn=None, mm_channel_id=None,
 ):
     """Periodic heartbeat: check status for each conductor and trigger checks."""
     global_interval = config["heartbeat_interval"]
@@ -2833,6 +3257,15 @@ async def heartbeat_loop(
                                 "Failed to send Discord notification: %s", e
                             )
 
+                    # Notify via Mattermost
+                    if mm_post_fn:
+                        try:
+                            await mm_post_fn(alert_msg)
+                        except Exception as e:
+                            log.error(
+                                "Failed to send Mattermost notification: %s", e
+                            )
+
                 # Run post-heartbeat hook (non-gating)
                 invoke_hook(profile, "post-heartbeat", {
                     "profile": profile,
@@ -2860,15 +3293,23 @@ async def main():
     tg_ok = config["telegram"]["configured"] and HAS_AIOGRAM
     sl_ok = config["slack"]["configured"] and HAS_SLACK
     dc_ok = config["discord"]["configured"] and HAS_DISCORD
+    mm_ok = config["mattermost"]["configured"] and HAS_MATTERMOST
 
-    if not tg_ok and not sl_ok and not dc_ok:
+    if not tg_ok and not sl_ok and not dc_ok and not mm_ok:
         if config["telegram"]["configured"] and not HAS_AIOGRAM:
             log.error("Telegram configured but aiogram not installed. pip install aiogram")
         if config["slack"]["configured"] and not HAS_SLACK:
             log.error("Slack configured but slack-bolt not installed. pip install slack-bolt slack-sdk")
         if config["discord"]["configured"] and not HAS_DISCORD:
             log.error("Discord configured but discord.py not installed. pip install discord.py")
-        if not config["telegram"]["configured"] and not config["slack"]["configured"] and not config["discord"]["configured"]:
+        if config["mattermost"]["configured"] and not HAS_MATTERMOST:
+            log.error("Mattermost configured but mattermostautodriver not installed. pip install mattermostautodriver")
+        if (
+            not config["telegram"]["configured"]
+            and not config["slack"]["configured"]
+            and not config["discord"]["configured"]
+            and not config["mattermost"]["configured"]
+        ):
             log.error("No messaging platform configured. Exiting.")
         sys.exit(1)
 
@@ -2879,6 +3320,8 @@ async def main():
         platforms.append("Slack")
     if dc_ok:
         platforms.append("Discord")
+    if mm_ok:
+        platforms.append("Mattermost")
 
     log.info(
         "Starting conductor bridge (platforms=%s, heartbeat=%dm, conductors=%s)",
@@ -2910,6 +3353,13 @@ async def main():
         if result:
             discord_bot, discord_channel_id = result
 
+    # Create Mattermost bridge
+    mm_driver, mm_channel_id, mm_ws_runner = None, None, None
+    if mm_ok:
+        result = create_mattermost_bridge(config)
+        if result:
+            mm_driver, mm_channel_id, mm_ws_runner = result
+
     # Pre-start all conductors so they're warm when messages arrive
     for c in conductors:
         if await ensure_conductor_running(c["name"], c["profile"]):
@@ -2918,6 +3368,16 @@ async def main():
             log.warning("Failed to pre-start conductor %s", c["name"])
 
     # Start heartbeat (shared, notifies all platforms)
+    # Build a bound async post function for Mattermost heartbeat notifications.
+    # This is None when Mattermost is not configured so heartbeat_loop can do a
+    # simple truthiness check without importing mm internals.
+    mm_post_fn = None
+    if mm_driver is not None:
+        async def _mm_hb_post(text: str) -> None:
+            for chunk in split_message(text, max_len=MATTERMOST_MAX_LENGTH):
+                await mm_driver.posts.create_post(channel_id=mm_channel_id, message=chunk)
+        mm_post_fn = _mm_hb_post
+
     heartbeat_task = asyncio.create_task(
         heartbeat_loop(
             config,
@@ -2926,6 +3386,8 @@ async def main():
             slack_channel_id=slack_channel_id,
             discord_bot=discord_bot,
             discord_channel_id=discord_channel_id,
+            mm_post_fn=mm_post_fn,
+            mm_channel_id=mm_channel_id,
         )
     )
 
@@ -2940,6 +3402,9 @@ async def main():
     if discord_bot:
         tasks.append(asyncio.create_task(discord_bot.start(config["discord"]["bot_token"])))
         log.info("Discord bot started")
+    if mm_ws_runner:
+        tasks.append(asyncio.create_task(mm_ws_runner()))
+        log.info("Mattermost WebSocket listener started")
 
     try:
         await asyncio.gather(*tasks)
@@ -2951,6 +3416,11 @@ async def main():
             await slack_handler.close_async()
         if discord_bot:
             await discord_bot.close()
+        if mm_driver:
+            try:
+                await mm_driver.logout()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

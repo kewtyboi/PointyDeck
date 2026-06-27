@@ -90,6 +90,9 @@ type ConductorSettings struct {
 	// Discord defines Discord bot integration settings
 	Discord DiscordSettings `toml:"discord,omitempty"`
 
+	// Mattermost defines Mattermost bot integration settings
+	Mattermost MattermostSettings `toml:"mattermost,omitempty"`
+
 	// Dir overrides the base conductor directory. Empty = default
 	// (<data-dir>/conductor with legacy ~/.agent-deck/conductor fallback).
 	// Tilde and $VAR are expanded.
@@ -157,6 +160,31 @@ type DiscordSettings struct {
 	// IgnoreRepliesToOthers skips forwarding replies unless they reply to the bot itself.
 	// Default: false
 	IgnoreRepliesToOthers bool `toml:"ignore_replies_to_others,omitempty"`
+}
+
+// MattermostSettings defines Mattermost bot configuration for the conductor bridge
+type MattermostSettings struct {
+	// URL is the Mattermost server URL (e.g. http://localhost:8065)
+	URL string `toml:"url,omitempty"`
+
+	// Token is the Mattermost bot access token
+	Token string `toml:"token,omitempty"`
+
+	// Team is the Mattermost team slug (used for display/logging; channel_id is authoritative)
+	Team string `toml:"team,omitempty"`
+
+	// ChannelID is the Mattermost channel ID where the bot listens and posts
+	ChannelID string `toml:"channel_id,omitempty"`
+
+	// AllowedUserIDs is a list of Mattermost user IDs authorised to use the bot.
+	// When empty and AllowAllUsersForDev is false (default), the bridge refuses all
+	// inbound Mattermost input (fail closed). Set at least one ID for production use.
+	AllowedUserIDs []string `toml:"allowed_user_ids,omitempty"`
+
+	// AllowAllUsersForDev bypasses the fail-closed default when AllowedUserIDs is empty.
+	// When false (default), empty AllowedUserIDs means the bridge refuses all Mattermost
+	// input (fail closed); set true only for dev.
+	AllowAllUsersForDev bool `toml:"allow_all_users_for_dev,omitempty"`
 }
 
 // ConductorMeta holds metadata for a named conductor instance
