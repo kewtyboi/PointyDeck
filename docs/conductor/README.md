@@ -183,7 +183,6 @@ They are optional — the conductor works fully without them.
 - [Slack](slack.md) — channel-based control with slash commands and threaded replies
 - [Discord](discord.md) — server-based control with permission scopes
 - [Mattermost](mattermost.md) - self-hosted channel-based control via WebSocket and REST
-- [Mattermost](mattermost.md) - self-hosted channel-based control via WebSocket and REST
 
 ![Channels topology — one bot per conductor](assets/channels-topology.svg)
 

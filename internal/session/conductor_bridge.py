@@ -2668,8 +2668,9 @@ def create_mattermost_bridge(config: dict):
     (via mattermostautodriver AsyncTypedDriver) for outbound messages.
     No Socket Mode needed: auth is a plain bot access token (Bearer).
 
-    Returns (driver, channel_id) or None if Mattermost is not configured
-    or mattermostautodriver is not available.
+    Returns (driver, channel_id, websocket_runner) or None if Mattermost is not configured
+    or mattermostautodriver is not available. websocket_runner is a callable that starts
+    the WebSocket event loop, or None if the WebSocket could not be initialised.
     """
     if not HAS_MATTERMOST:
         log.warning("mattermostautodriver not installed, skipping Mattermost bridge")
