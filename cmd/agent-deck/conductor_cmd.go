@@ -1046,8 +1046,29 @@ func handleConductorStatus(_ string, args []string) {
 		Description          string `json:"description,omitempty"`
 		LastActivityAt       string `json:"last_activity_at,omitempty"`
 		HeartbeatIdleMinutes int    `json:"heartbeat_idle_minutes"`
+		MattermostConfigured bool   `json:"mattermost_configured"`
+		MattermostWebsocket  string `json:"mattermost_websocket,omitempty"`
+		MattermostLastAuth   string `json:"mattermost_last_auth,omitempty"`
+		MattermostLastEvent  string `json:"mattermost_last_event,omitempty"`
+		MattermostLastError  string `json:"mattermost_last_error,omitempty"`
 	}
 	var statuses []conductorStatus
+
+	// Resolve Mattermost configured flag and health snapshot once before the loop.
+	var mmConfigured bool
+	var mmStatusSnapshot map[string]interface{}
+	if cfg, cfgErr := session.LoadUserConfig(); cfgErr == nil {
+		mmConfigured = cfg.Conductor.Mattermost.URL != ""
+	}
+	if conductorDir, dirErr := session.ConductorDir(); dirErr == nil {
+		statusPath := filepath.Join(conductorDir, "mattermost-status.json")
+		if data, readErr := os.ReadFile(statusPath); readErr == nil {
+			var snap map[string]interface{}
+			if json.Unmarshal(data, &snap) == nil {
+				mmStatusSnapshot = snap
+			}
+		}
+	}
 
 	for _, meta := range conductors {
 		cs := conductorStatus{
@@ -1084,6 +1105,23 @@ func handleConductorStatus(_ string, args []string) {
 						break
 					}
 				}
+			}
+		}
+
+		// Populate Mattermost health fields from global config and status snapshot.
+		cs.MattermostConfigured = mmConfigured
+		if mmStatusSnapshot != nil {
+			if v, ok := mmStatusSnapshot["websocket"].(string); ok {
+				cs.MattermostWebsocket = v
+			}
+			if v, ok := mmStatusSnapshot["last_successful_auth"].(string); ok {
+				cs.MattermostLastAuth = v
+			}
+			if v, ok := mmStatusSnapshot["last_event_time"].(string); ok {
+				cs.MattermostLastEvent = v
+			}
+			if v, ok := mmStatusSnapshot["last_error"].(string); ok {
+				cs.MattermostLastError = v
 			}
 		}
 

@@ -133,6 +133,61 @@ CONFIG_PATH = resolve_config_path("config.toml")
 # --- end issue #1350 resolver ---
 LOG_PATH = CONDUCTOR_DIR / "bridge.log"
 
+# Operator-observable Mattermost health. The Go CLI (agent-deck conductor
+# status) has no IPC channel to this standalone Python process, so the bridge
+# writes its websocket health here atomically and the CLI reads it best-effort.
+MATTERMOST_STATUS_PATH = CONDUCTOR_DIR / "mattermost-status.json"
+
+
+def _now_iso() -> str:
+    """UTC timestamp in RFC3339/ISO-8601 form (matches the Go CLI formatting)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def write_mattermost_status(status: dict) -> None:
+    """Atomically persist the Mattermost bridge health status for the Go CLI.
+
+    Best-effort: a failure to write health must never take down the bridge.
+    """
+    try:
+        MATTERMOST_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MATTERMOST_STATUS_PATH.with_name(MATTERMOST_STATUS_PATH.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(status, fh)
+        os.replace(tmp, MATTERMOST_STATUS_PATH)
+    except Exception as exc:
+        log.debug("Mattermost: could not write status file: %s", exc)
+
+
+def mattermost_is_authorized(
+    user_id: str,
+    allowed_users,
+    allow_all_dev: bool = False,
+) -> bool:
+    """Fail-closed Mattermost authorisation decision (pure, importable for tests).
+
+    - Non-empty allow-list: only listed users are accepted.
+    - Empty allow-list + allow_all_dev: accept all (dev escape hatch), WARN.
+    - Empty allow-list (hardened default): reject all inbound input.
+    """
+    if allowed_users:
+        if user_id not in allowed_users:
+            log.warning("Unauthorised Mattermost message from user %s", user_id)
+            return False
+        return True
+    if allow_all_dev:
+        log.warning(
+            "Mattermost DEV MODE: accepting input from unlisted user %s "
+            "(allow_all_users_for_dev=true); set allowed_user_ids for production",
+            user_id,
+        )
+        return True
+    log.warning(
+        "Mattermost message refused: allowed_user_ids is empty (hardened default "
+        "denies all inbound input). Set allowed_user_ids to enable."
+    )
+    return False
+
 # Telegram message length limit
 TG_MAX_LENGTH = 4096
 
@@ -274,6 +329,11 @@ def load_config() -> dict:
     mm_team = mm.get("team", "")
     mm_channel_id = mm.get("channel_id", "")
     mm_allowed_users = mm.get("allowed_user_ids", [])
+    # Dev-only escape hatch: when no allow-list is set the bridge is
+    # fail-closed (all inbound input refused) UNLESS this is explicitly
+    # enabled. Never set in production - it accepts commands from any
+    # Mattermost user in the channel.
+    mm_allow_all_dev = bool(mm.get("allow_all_users_for_dev", False))
     mm_configured = bool(mm_url and mm_token and mm_channel_id)
 
     if not tg_configured and not sl_configured and not dc_configured and not mm_configured:
@@ -312,6 +372,7 @@ def load_config() -> dict:
             "team": mm_team,
             "channel_id": mm_channel_id,
             "allowed_user_ids": mm_allowed_users,
+            "allow_all_users_for_dev": mm_allow_all_dev,
             "configured": mm_configured,
         },
         "heartbeat_interval": conductor_cfg.get("heartbeat_interval", 15),
@@ -2621,6 +2682,20 @@ def create_mattermost_bridge(config: dict):
     token = mm_cfg["token"]
     channel_id = mm_cfg["channel_id"]
     allowed_users = mm_cfg["allowed_user_ids"]
+    allow_all_dev = mm_cfg.get("allow_all_users_for_dev", False)
+
+    # Mutable health snapshot persisted to MATTERMOST_STATUS_PATH on changes.
+    mm_status = {
+        "websocket": "disconnected",
+        "connected": False,
+        "last_successful_auth": "",
+        "last_event_time": "",
+        "last_error": "",
+    }
+
+    def _update_status(**changes) -> None:
+        mm_status.update(changes)
+        write_mattermost_status(mm_status)
 
     # Parse scheme + host + optional port from the configured URL
     import urllib.parse as _urlparse
@@ -2637,13 +2712,8 @@ def create_mattermost_bridge(config: dict):
     })
 
     def is_mm_authorized(user_id: str) -> bool:
-        """Return True when user_id is in the allow-list (or list is empty)."""
-        if not allowed_users:
-            return True
-        if user_id not in allowed_users:
-            log.warning("Unauthorised Mattermost message from user %s", user_id)
-            return False
-        return True
+        """Fail-closed authorisation (delegates to mattermost_is_authorized)."""
+        return mattermost_is_authorized(user_id, allowed_users, allow_all_dev)
 
     async def _mm_post(text: str) -> None:
         """Post a message to the configured Mattermost channel, splitting if needed."""
@@ -2687,6 +2757,8 @@ def create_mattermost_bridge(config: dict):
         if post.get("channel_id") != channel_id:
             return
 
+        _update_status(last_event_time=_now_iso())
+
         # Ignore the bot's own posts (user_id matches the driver's own user)
         own_user_id = getattr(driver, "_user_id", None)
         sender_id = post.get("user_id", "")
@@ -2701,7 +2773,7 @@ def create_mattermost_bridge(config: dict):
         if not text:
             return
 
-        log.info("Mattermost message from %s: %s", sender_id, text[:100])
+        log.info("Mattermost message from %s (%d chars)", sender_id, len(text))
 
         conductor_names = get_conductor_names()
         conductors = discover_conductors()
@@ -2802,7 +2874,7 @@ def create_mattermost_bridge(config: dict):
             await _mm_post(f"[Failed to send message to conductor {target['name']}.]")
             return
 
-        log.info("Conductor [%s] Mattermost response: %s", target["name"], response[:100])
+        log.info("Conductor [%s] Mattermost response (%d chars)", target["name"], len(response))
         for chunk in split_message(response, max_len=MATTERMOST_MAX_LENGTH):
             prefixed = f"{name_tag}{chunk}" if name_tag else chunk
             await _mm_post(prefixed)
@@ -2813,21 +2885,106 @@ def create_mattermost_bridge(config: dict):
             "response": response,
         })
 
-    async def _run_websocket() -> None:
-        """Authenticate then start the Mattermost WebSocket listener loop."""
-        await driver.login()
-        # Cache the bot's own user_id so we can filter self-posts
+    async def _ensure_own_user_id() -> None:
+        """Fetch and cache the bot's own user_id for self-post filtering.
+
+        Retried on every (re)connect: a missing id would let the bot echo its
+        own posts back into the conductor (latent self-loop bug).
+        """
+        if getattr(driver, "_user_id", ""):
+            return
         try:
             me = await driver.users.get_user("me")
             driver._user_id = me.get("id", "")
-            log.info("Mattermost bot user_id: %s", driver._user_id)
         except Exception as exc:
-            log.warning("Mattermost: could not fetch own user_id: %s", exc)
             driver._user_id = ""
+            log.warning("Mattermost: could not fetch own user_id: %s", exc)
+        if getattr(driver, "_user_id", ""):
+            log.info("Mattermost bot user_id: %s", driver._user_id)
+        else:
+            log.warning(
+                "Mattermost: own user_id unknown - self-post filtering is "
+                "disabled until it can be fetched (echo-loop risk)"
+            )
 
-        log.info("Mattermost WebSocket connecting to %s:%s", host, port)
-        await driver.init_websocket(_mm_event_handler)
+    async def _run_websocket() -> None:
+        """Authenticate and run the listener with capped-backoff reconnect.
 
+        Mirrors the Slack reconnect pattern: exponential backoff to 60s, reset
+        on a successful (re)connect, and suppressed repeated-failure log spam
+        so a downed Mattermost server does not flood the bridge log.
+        """
+        backoff = 1
+        max_backoff = 60
+        consecutive_failures = 0
+        _update_status(websocket="connecting", connected=False)
+        while True:
+            try:
+                await driver.login()
+                await _ensure_own_user_id()
+                log.info("Mattermost WebSocket connecting to %s:%s", host, port)
+                # Successful auth: reset backoff and publish healthy status.
+                backoff = 1
+                consecutive_failures = 0
+                _update_status(
+                    websocket="connected",
+                    connected=True,
+                    last_successful_auth=_now_iso(),
+                    last_error="",
+                )
+                # Returns when the socket closes; treated as a reconnect trigger.
+                await driver.init_websocket(_mm_event_handler)
+                _update_status(websocket="disconnected", connected=False)
+                log.warning(
+                    "Mattermost WebSocket closed; reconnecting in %ds", backoff
+                )
+            except asyncio.CancelledError:
+                _update_status(websocket="disconnected", connected=False)
+                raise
+            except Exception as exc:
+                consecutive_failures += 1
+                _update_status(
+                    websocket="disconnected",
+                    connected=False,
+                    last_error=str(exc)[:200],
+                )
+                # Log the first few failures, then every 10th, to bound spam.
+                if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
+                    log.warning(
+                        "Mattermost WebSocket error (failure #%d): %s; "
+                        "retrying in %ds",
+                        consecutive_failures, exc, backoff,
+                    )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+
+    # Fail-closed startup gate: a configured bridge with no allow-list (and no
+    # dev override) accepts NO inbound input. Disable the listener cleanly so
+    # the rest of the multi-bridge process (Slack/Telegram/Discord) keeps
+    # running; outbound notifications via the driver still work.
+    input_enabled = bool(allowed_users) or allow_all_dev
+    if not input_enabled:
+        log.warning(
+            "Mattermost INPUT DISABLED (hardened default): bridge is configured "
+            "but [conductor.mattermost].allowed_user_ids is empty and "
+            "allow_all_users_for_dev is not set. Inbound commands are refused "
+            "until you set allowed_user_ids; outbound notifications still work."
+        )
+        _update_status(websocket="input_disabled", connected=False)
+        log.info(
+            "Mattermost bridge initialised (channel=%s, input disabled)",
+            channel_id,
+        )
+        return driver, channel_id, None
+
+    if allow_all_dev and not allowed_users:
+        log.warning(
+            "Mattermost DEV MODE active: allow_all_users_for_dev=true - the "
+            "bridge will accept inbound commands from ANY user in the channel. "
+            "Do not use this in production; set allowed_user_ids instead."
+        )
+
+    _update_status(websocket="disconnected", connected=False)
     log.info("Mattermost bridge initialised (channel=%s)", channel_id)
     return driver, channel_id, _run_websocket
 

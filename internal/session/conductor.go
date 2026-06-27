@@ -177,8 +177,14 @@ type MattermostSettings struct {
 	ChannelID string `toml:"channel_id,omitempty"`
 
 	// AllowedUserIDs is a list of Mattermost user IDs authorised to use the bot.
-	// If empty, all users are allowed (backward compatible).
+	// When empty and AllowAllUsersForDev is false (default), the bridge refuses all
+	// inbound Mattermost input (fail closed). Set at least one ID for production use.
 	AllowedUserIDs []string `toml:"allowed_user_ids,omitempty"`
+
+	// AllowAllUsersForDev bypasses the fail-closed default when AllowedUserIDs is empty.
+	// When false (default), empty AllowedUserIDs means the bridge refuses all Mattermost
+	// input (fail closed); set true only for dev.
+	AllowAllUsersForDev bool `toml:"allow_all_users_for_dev,omitempty"`
 }
 
 // ConductorMeta holds metadata for a named conductor instance
