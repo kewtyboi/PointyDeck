@@ -3291,22 +3291,34 @@ def create_mattermost_bridge(config: dict):
         #     found in get_sessions_list() is addressed (rare in practice).
         #   - Conductor sessions (title starting "conductor-") are excluded.
         #
-        # Security: the message still passed the auth gate, webhook-drop check,
-        # and rate limiter above, so no boundary is weakened.
+        # Security: A2 messages pass auth, webhook-drop (I1), and rate-limit
+        # (M2) above. The pre-message hook and M1 audit are applied inside the
+        # match block below before any reply is sent to the child session.
         _a2_profile = None
         _a2_session_title = None
         _a2_body = None
         _a2_conductor_name = None
-        for _a2_c in discover_conductors():
-            _a2_prof = _a2_c.get("profile") or "default"
-            _a2_sess_list = get_sessions_list(_a2_prof)
-            _a2_matched_title, _a2_matched_body = parse_session_reply_prefix(text, _a2_sess_list)
-            if _a2_matched_title:
-                _a2_session_title = _a2_matched_title
-                _a2_body = _a2_matched_body
-                _a2_profile = _a2_prof
-                _a2_conductor_name = _a2_c.get("name", "")
-                break
+        # P2: quick syntactic pre-check -- a direct-session reply always
+        # contains ": " (colon-space). Skip the I/O-heavy scan entirely for
+        # ordinary commands so get_sessions_list() (which shells out via
+        # run_cli with a 30s timeout per conductor) never runs unless the
+        # message actually looks like a session reply.
+        if ": " in text:
+            # Move the full scan off the event loop. run_in_executor prevents
+            # blocking the WebSocket handler while run_cli waits for the CLI.
+            def _a2_scan_conductors():
+                for _c in discover_conductors():
+                    _prof = _c.get("profile") or "default"
+                    _sessions = get_sessions_list(_prof)
+                    _title, _body_found = parse_session_reply_prefix(text, _sessions)
+                    if _title:
+                        return _c.get("name", ""), _prof, _title, _body_found
+                return None
+            _a2_scan_result = await asyncio.get_running_loop().run_in_executor(
+                None, _a2_scan_conductors
+            )
+            if _a2_scan_result:
+                _a2_conductor_name, _a2_profile, _a2_session_title, _a2_body = _a2_scan_result
 
         if _a2_session_title and _a2_body:
             log.info(
@@ -3314,6 +3326,35 @@ def create_mattermost_bridge(config: dict):
                 sender_id, _a2_session_title,
             )
             _a2_loop = asyncio.get_running_loop()
+            # P1: run the pre-message hook for A2 replies -- same gate as the
+            # normal command path so operators can inspect, rewrite, or refuse
+            # direct-session replies before they reach the child session.
+            _a2_hook = await _a2_loop.run_in_executor(
+                None,
+                functools.partial(invoke_hook, _a2_profile, "pre-message", {
+                    "profile": _a2_profile,
+                    "message_text": _a2_body,
+                    "user_id": sender_id,
+                }),
+            )
+            if _a2_hook is not None:
+                _a2_hook_ok, _a2_hook_out = _a2_hook
+                if not _a2_hook_ok:
+                    log.info(
+                        "Mattermost: A2 reply dropped by pre-message hook for [%s]",
+                        _a2_profile,
+                    )
+                    return
+                if _a2_hook_out:
+                    _a2_body = _a2_hook_out
+            # M1: Audit log for A2 direct-session replies. Recorded after
+            # passing the pre-message hook so only unblocked messages appear.
+            mm_write_audit(
+                sender_id=sender_id,
+                intent="a2-session-reply",
+                channel=channel_id,
+                target_name=_a2_session_title,
+            )
             _a2_ok, _a2_response, _ = await _a2_loop.run_in_executor(
                 None,
                 functools.partial(
