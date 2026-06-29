@@ -30,6 +30,7 @@ from bridge import (
     classify_message,
     mm_should_drop_webhook,
     mm_write_audit,
+    parse_conductor_prefix,
     resolve_allow_all_dev,
     scan_and_redact_secrets,
 )
@@ -118,6 +119,40 @@ class TestC2ClassifyMessage:
         monkeypatch.delenv("AGENTBRIDGE_ALLOWED_VERBS", raising=False)
         intent, _ = classify_message("help")
         assert intent == "help"
+
+    def test_conductor_prefix_stripped_before_gate(self):
+        """After stripping a conductor prefix, the remaining verb is classified.
+
+        Regression test for the P2 ordering bug: the handler must call
+        parse_conductor_prefix() BEFORE classify_message() so that a routed
+        command like "alpha: status" is not rejected because "alpha:" is not
+        an allowed verb. This test documents the correct chaining contract.
+        """
+        conductors = ["alpha", "beta"]
+        _, stripped = parse_conductor_prefix("alpha: status report", conductors)
+        # stripped is "status report" -- verb is "status"
+        intent, reply = classify_message(stripped)
+        assert intent == "status", (
+            "Conductor-prefixed command should pass after prefix is stripped; "
+            "got refusal: " + repr(reply)
+        )
+        assert reply is None
+
+    def test_verb_with_args_passes_full_payload(self):
+        """Document that verb + free-form args reach the conductor unchanged.
+
+        SCOPE: classify_message checks only the first token (verb). The remainder
+        of the message (parameters) is forwarded to the conductor as-is. This is
+        intentional -- structured args like "land 123" need to reach the agent.
+        Operators who require parameter-level restriction must install a
+        pre-message hook. This test documents and pins that contract so a future
+        refactor does not accidentally strip args that operators depend on.
+        """
+        # All of these pass the verb gate; the full text is what reaches the agent.
+        for msg in ("land 123", "review 456", "status verbose", "apex plan"):
+            verb, reply = classify_message(msg)
+            assert verb is not None, f"Expected pass for {msg!r}, got refusal"
+            assert reply is None
 
 
 # ---------------------------------------------------------------------------

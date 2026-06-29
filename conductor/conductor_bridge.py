@@ -3196,10 +3196,29 @@ def create_mattermost_bridge(config: dict):
             )
             return
 
+        # Strip conductor prefix BEFORE the verb gate so that multi-conductor
+        # commands like "alpha: status" are not rejected because "alpha:" is not
+        # an allowed verb. The gate must see the stripped verb ("status"), not
+        # the full routing prefix. Fixes the P2 regression raised by the bot
+        # review: users could no longer direct commands to non-default conductors
+        # while the other bridges still supported that routing.
+        conductor_names = get_conductor_names()
+        conductors = discover_conductors()
+        target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
+        if not cleaned_msg:
+            cleaned_msg = text
+
         # C2: Command grammar / intent gate.
-        # Free-form text is refused on the privileged conductor path.
-        # Only messages whose first token matches the allow-list proceed.
-        intent, refusal_reply = classify_message(text, allowed_verbs=mm_allowed_verbs)
+        # The first whitespace-delimited token of cleaned_msg must be in the
+        # allow-list; everything else is refused with a help reply.
+        # SCOPE NOTE: the gate checks only the verb (first token). The remainder
+        # of cleaned_msg (parameters, e.g. PR number, branch name) is forwarded
+        # to the conductor unchanged. This is intentional -- structured params
+        # such as "land 123" need to reach the agent. Operators who need to
+        # restrict or sanitise parameters further should install a pre-message
+        # hook (conductor/<profile>/hooks/pre-message) that inspects and
+        # optionally rewrites or refuses cleaned_msg before it reaches the agent.
+        intent, refusal_reply = classify_message(cleaned_msg, allowed_verbs=mm_allowed_verbs)
         if intent is None:
             if refusal_reply:
                 asyncio.get_running_loop().create_task(_mm_post(refusal_reply))
@@ -3220,10 +3239,6 @@ def create_mattermost_bridge(config: dict):
             len(text),
         )
 
-        conductor_names = get_conductor_names()
-        conductors = discover_conductors()
-        target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
-
         target = None
         if target_name:
             for c in conductors:
@@ -3235,9 +3250,6 @@ def create_mattermost_bridge(config: dict):
         if target is None:
             await _mm_post("[No conductors configured. Run: agent-deck conductor setup <name>]")
             return
-
-        if not cleaned_msg:
-            cleaned_msg = text
 
         session_title = conductor_session_title(target["name"])
         profile = target["profile"]
