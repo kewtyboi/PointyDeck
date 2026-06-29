@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import math
@@ -778,7 +779,7 @@ def run_cli(
     log.debug("CLI: %s", " ".join(cmd))
     try:
         # Use Popen + communicate(timeout=) so we have the proc object available
-        # when TimeoutExpired fires — subprocess.run() does NOT set exc.proc.
+        # when TimeoutExpired fires - subprocess.run() does NOT set exc.proc.
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -807,14 +808,14 @@ def run_cli(
 def get_session_status(session: str, profile: str | None = None) -> str:
     """Get the status of a session (running/waiting/idle/error/unknown).
 
-    Returns "unknown" on CLI failure or parse error — callers should treat
+    Returns "unknown" on CLI failure or parse error - callers should treat
     this as a transient condition and retry rather than dropping state.
     """
     result = run_cli(
         "session", "show", session, "--json", profile=profile, timeout=30
     )
     if result.returncode != 0:
-        return "unknown"  # transient CLI failure — not the same as conductor broken
+        return "unknown"  # transient CLI failure - not the same as conductor broken
     try:
         data = json.loads(result.stdout)
         return data.get("status", "unknown")
@@ -848,7 +849,7 @@ ReplyCallback = Callable[[str], Coroutine[Any, Any, None]]
 
 def _is_still_running_timeout(stderr: str) -> bool:
     """True when a blocking `--wait` failed *only* because the turn outran the
-    timeout while the agent keeps working — the message WAS delivered.
+    timeout while the agent keeps working - the message WAS delivered.
 
     The CLI reports this with stderr like:
         "timeout waiting for completion: agent still running after 5m0s"
@@ -887,7 +888,7 @@ def send_to_conductor(
     redundant blocking subprocess call.
     """
     if not wait_for_reply:
-        # force_queue: caller already confirmed conductor is busy — skip status check.
+        # force_queue: caller already confirmed conductor is busy - skip status check.
         if force_queue:
             log.info("Conductor %s: force-queueing message", session)
             _enqueue_message(session, message, profile, reply_callback)
@@ -954,7 +955,7 @@ def send_to_conductor(
 # Message queue for busy conductors
 # ---------------------------------------------------------------------------
 
-# Per-session max depth — prevents unbounded memory growth when conductor is stuck.
+# Per-session max depth - prevents unbounded memory growth when conductor is stuck.
 MAX_QUEUE_DEPTH = 20
 
 # In-memory queue: {session_title: deque[(message, profile, reply_callback), ...]}
@@ -1009,7 +1010,7 @@ def _enqueue_message(
                 loop = asyncio.get_running_loop()
                 loop.create_task(_fire_callback(
                     dropped_cb,
-                    "[Message dropped — conductor queue overflow.]",
+                    "[Message dropped - conductor queue overflow.]",
                 ))
             except RuntimeError:
                 pass  # no event loop available, can't fire async callback
@@ -1033,7 +1034,7 @@ async def _fire_callback(cb: ReplyCallback, text: str) -> None:
 def _ensure_drain_task() -> None:
     """Start the background drain task if it's not already running.
 
-    Safe to call from sync context — silently skips if no event loop is running.
+    Safe to call from sync context - silently skips if no event loop is running.
     """
     global _drain_task
     if _drain_task is not None and _drain_task.done() and not _drain_task.cancelled():
@@ -1044,7 +1045,7 @@ def _ensure_drain_task() -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            log.warning("No running event loop — drain task deferred to next async call")
+            log.warning("No running event loop - drain task deferred to next async call")
             return
         _drain_task = loop.create_task(_drain_queue_supervised())
 
@@ -1096,7 +1097,7 @@ async def _drain_queue() -> None:
                 functools.partial(get_session_status, session, profile=profile),
             )
 
-            # Still busy or transient CLI failure — retry next cycle
+            # Still busy or transient CLI failure - retry next cycle
             if status in ("running", "active", "starting", "unknown"):
                 continue
 
@@ -1110,11 +1111,11 @@ async def _drain_queue() -> None:
                     if cb is not None:
                         loop.create_task(_fire_callback(
                             cb,
-                            "[Queued message could not be delivered — conductor is in error state.]",
+                            "[Queued message could not be delivered - conductor is in error state.]",
                         ))
                 continue
 
-            # Conductor is ready — deliver the message and wait for the response
+            # Conductor is ready - deliver the message and wait for the response
             result = await loop.run_in_executor(
                 None,
                 functools.partial(
@@ -1153,7 +1154,7 @@ async def _drain_queue() -> None:
                     )
                 else:
                     log.error(
-                        "Failed to deliver queued message to %s: %s — dropping",
+                        "Failed to deliver queued message to %s: %s - dropping",
                         session, stderr,
                     )
                     items.popleft()
@@ -1162,10 +1163,10 @@ async def _drain_queue() -> None:
                     if reply_callback is not None:
                         loop.create_task(_fire_callback(
                             reply_callback,
-                            f"[Queued message could not be delivered — send failed: {stderr[:100]}]",
+                            f"[Queued message could not be delivered - send failed: {stderr[:100]}]",
                         ))
 
-        # Exit check AFTER the session loop — avoids missing items enqueued during drain
+        # Exit check AFTER the session loop - avoids missing items enqueued during drain
         if not _message_queue:
             log.info("Queue drain task finished (queue empty)")
             return
@@ -1178,10 +1179,10 @@ async def _drain_queue() -> None:
 # When the conductor is IDLE on arrival the handler delivers the message with a
 # blocking `session send --wait --timeout {RESPONSE_TIMEOUT}s`. If that single
 # turn outruns the timeout the message is already delivered and the agent keeps
-# working — only the synchronous reply is lost. send_to_conductor flags this
+# working - only the synchronous reply is lost. send_to_conductor flags this
 # (still_running=True); the handler then registers a reply-only watcher here.
 #
-# Unlike _drain_queue this NEVER sends a message — the message is already
+# Unlike _drain_queue this NEVER sends a message - the message is already
 # in-flight, so re-sending would double-process it. The watcher only polls
 # until the turn finishes and delivers the captured output via reply_callback.
 
@@ -1203,7 +1204,7 @@ async def _watch_pending_reply(
 
     Used when a blocking `--wait` send timed out because the agent is still
     running (not a send failure). The message was already delivered, so this
-    does NOT re-send — it polls until the conductor leaves the busy state and
+    does NOT re-send - it polls until the conductor leaves the busy state and
     then fires reply_callback exactly once with the captured output.
 
     Mirrors _drain_queue's polling/backoff but never sends a message. Caps the
@@ -1215,14 +1216,14 @@ async def _watch_pending_reply(
         status = await loop.run_in_executor(
             None, functools.partial(get_session_status, session, profile=profile),
         )
-        # Still working, or a transient CLI failure — keep waiting. This also
+        # Still working, or a transient CLI failure - keep waiting. This also
         # naturally handles the race where the conductor finishes between the
         # timeout and this first poll: a non-busy status falls straight through
         # to fetching the output below.
         if status in ("running", "active", "starting", "unknown"):
             await asyncio.sleep(PENDING_REPLY_POLL_INTERVAL)
             continue
-        # The turn is no longer running (idle/waiting/error/...) — fetch whatever
+        # The turn is no longer running (idle/waiting/error/...) - fetch whatever
         # output is available and deliver it once.
         output = await loop.run_in_executor(
             None, functools.partial(get_session_output, session, profile=profile),
@@ -1235,12 +1236,12 @@ async def _watch_pending_reply(
         return
 
     log.warning(
-        "Pending reply watcher for %s gave up after %ds — turn still running",
+        "Pending reply watcher for %s gave up after %ds - turn still running",
         session, PENDING_REPLY_MAX_WAIT,
     )
     await _fire_callback(
         reply_callback,
-        "[Conductor is still working after a long time — reply not captured. "
+        "[Conductor is still working after a long time - reply not captured. "
         "Check the session directly.]",
     )
 
@@ -1258,7 +1259,7 @@ def _register_pending_reply(
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        log.warning("No running event loop — cannot watch for pending reply on %s", session)
+        log.warning("No running event loop - cannot watch for pending reply on %s", session)
         return
     task = loop.create_task(_watch_pending_reply(session, profile, reply_callback))
     _pending_reply_tasks.add(task)
@@ -1572,6 +1573,87 @@ def parse_conductor_prefix(text: str, conductor_names: list[str]) -> tuple[str |
 # once with a distinct "STILL BLOCKED" tactic, then drop on later cycles.
 NEED_RETIRE_THRESHOLD = 3
 
+# ---------------------------------------------------------------------------
+# Escalation state helpers (issue #979)
+# ---------------------------------------------------------------------------
+
+# Stall detection: a "running" session with no output-hash change for this
+# many minutes is flagged STALLED and posted to MM once (de-duped per session).
+# Configurable at module level; can be overridden in future config extension.
+STALL_MINUTES_DEFAULT = 30
+
+
+def _output_hash(text: str) -> str:
+    """Return a short SHA-256 hex digest for de-dup comparisons."""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def read_conductor_state(conductor_name: str) -> dict:
+    """Read state.json for a conductor. Returns {} on missing/parse error."""
+    state_path = CONDUCTOR_DIR / conductor_name / "state.json"
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def write_conductor_state(conductor_name: str, state: dict) -> None:
+    """Atomically write state.json for a conductor (best-effort)."""
+    state_path = CONDUCTOR_DIR / conductor_name / "state.json"
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, state_path)
+    except Exception as exc:
+        log.warning("Failed to write state.json for conductor %s: %s", conductor_name, exc)
+
+
+def mark_session_escalated(conductor_name: str, session_title: str) -> None:
+    """Set escalated=True for a session and increment escalations_today in state.json."""
+    state = read_conductor_state(conductor_name)
+    sessions = state.get("sessions", {})
+    for _k, v in sessions.items():
+        if isinstance(v, dict) and v.get("title") == session_title:
+            v["escalated"] = True
+    state["escalations_today"] = state.get("escalations_today", 0) + 1
+    write_conductor_state(conductor_name, state)
+
+
+def mark_auto_response(conductor_name: str) -> None:
+    """Increment auto_responses_today in state.json."""
+    state = read_conductor_state(conductor_name)
+    state["auto_responses_today"] = state.get("auto_responses_today", 0) + 1
+    write_conductor_state(conductor_name, state)
+
+
+def parse_session_reply_prefix(
+    text: str, sessions: list[dict]
+) -> tuple[str | None, str]:
+    """Detect a direct session-reply prefix in an inbound message.
+
+    Recognises ``<session_title>: <message>`` where ``session_title`` matches
+    a non-conductor session exactly (case-sensitive, first-match wins).
+
+    Returns ``(session_title, message_body)`` when matched, else
+    ``(None, text)`` so callers fall through to normal conductor routing.
+
+    Documented limit: if two sessions share an identical title the first found
+    in the list wins. Conductor-prefixed sessions (title starting with
+    "conductor-") are excluded to avoid collisions with the existing
+    conductor-prefix routing.
+    """
+    for s in sessions:
+        s_title = s.get("title", "")
+        if not s_title or s_title.startswith("conductor-"):
+            continue
+        prefix = f"{s_title}:"
+        if text.startswith(prefix):
+            return s_title, text[len(prefix):].strip()
+    return None, text
+
 
 def filter_need_lines(
     response: str,
@@ -1588,11 +1670,11 @@ def filter_need_lines(
         a one-shot escalation. Subsequent cycles drop the line entirely.
 
     Returns dict with:
-      "alerts":  list[str]  — NEED lines to forward as-is this cycle.
-      "retired": list[str]  — one-shot escalation notices for lines that just
+      "alerts":  list[str]  - NEED lines to forward as-is this cycle.
+      "retired": list[str]  - one-shot escalation notices for lines that just
                               hit threshold (forwarded instead of the plain
                               NEED line so the user sees the tactic change).
-      "counts":  dict[str,int] — updated counts for the next cycle. Lines no
+      "counts":  dict[str,int] - updated counts for the next cycle. Lines no
                               longer present are dropped (reset on return).
 
     Rules (matches issue #971's expected table):
@@ -1620,7 +1702,7 @@ def filter_need_lines(
             retired.append(
                 f"STILL BLOCKED ({threshold} cycles, no reply): {line}"
             )
-        # new_count > threshold: dropped — already retired previously.
+        # new_count > threshold: dropped - already retired previously.
 
     return {"alerts": alerts, "retired": retired, "counts": counts}
 
@@ -2030,7 +2112,7 @@ def create_telegram_bot(config: dict):
         profiles = get_unique_profiles()
         profile_tag = f"[{target_profile}] " if len(profiles) > 1 else ""
 
-        # Check if conductor is busy — non-blocking via executor
+        # Check if conductor is busy - non-blocking via executor
         loop = asyncio.get_running_loop()
         conductor_status = await loop.run_in_executor(
             None, functools.partial(get_session_status, session_title, profile=target_profile)
@@ -2075,7 +2157,7 @@ def create_telegram_bot(config: dict):
             )
             return
 
-        # Conductor is free — send and wait for reply (non-blocking via executor)
+        # Conductor is free - send and wait for reply (non-blocking via executor)
         await message.answer(f"{profile_tag}\u23f3")  # typing indicator before blocking
         wait_started_at = time.monotonic()
         ok, response, still_running = await loop.run_in_executor(
@@ -2093,7 +2175,7 @@ def create_telegram_bot(config: dict):
             if still_running:
                 # The message WAS delivered; the single turn just outran the
                 # blocking wait. Don't report a false failure and don't re-send
-                # (that would double-process) — watch for the reply async-ly.
+                # (that would double-process) - watch for the reply async-ly.
                 tg_bot = message.bot
                 tg_chat_id = message.chat.id
                 profile_tag_captured = profile_tag
@@ -2112,7 +2194,7 @@ def create_telegram_bot(config: dict):
 
                 _register_pending_reply(session_title, target_profile, _tg_late_reply)
                 await message.answer(
-                    f"{profile_tag}⏳ Still working — will reply here when done."
+                    f"{profile_tag}⏳ Still working - will reply here when done."
                 )
                 return
             await message.answer(
@@ -2374,7 +2456,7 @@ def create_slack_app(config: dict):
             )
             return
 
-        # Check if conductor is busy — non-blocking via executor
+        # Check if conductor is busy - non-blocking via executor
         loop = asyncio.get_running_loop()
         conductor_status = await loop.run_in_executor(
             None, functools.partial(get_session_status, session_title, profile=profile)
@@ -2999,7 +3081,7 @@ def create_discord_bot(config: dict):
             if still_running:
                 # The message WAS delivered; the single turn just outran the
                 # blocking wait. Don't report a false failure and don't re-send
-                # (that would double-process) — watch for the reply async-ly.
+                # (that would double-process) - watch for the reply async-ly.
                 # Mirrors the Telegram/Slack idle paths (#1404).
                 dc_channel = message.channel
                 dc_name_tag = (
@@ -3013,7 +3095,7 @@ def create_discord_bot(config: dict):
 
                 _register_pending_reply(session_title, profile, _dc_late_reply)
                 await message.channel.send(
-                    "⏳ Still working — will reply here when done.",
+                    "⏳ Still working - will reply here when done.",
                 )
                 return
             await message.channel.send(
@@ -3194,6 +3276,65 @@ def create_mattermost_bridge(config: dict):
                 "Mattermost: rate limit exceeded for sender %s; message dropped",
                 sender_id,
             )
+            return
+
+        # A2 (#979): Direct session reply routing.
+        # Detect "<session_title>: <body>" prefix BEFORE the C2 verb gate and
+        # the conductor-prefix strip. A session title is not in the allowed-verb
+        # list, so running it through classify_message() would refuse it.
+        # When matched we route directly to the child session, bypassing the
+        # conductor entirely, and return early.
+        #
+        # Documented limits:
+        #   - Title match is exact and case-sensitive.
+        #   - First-match wins; if two active sessions share a title the first
+        #     found in get_sessions_list() is addressed (rare in practice).
+        #   - Conductor sessions (title starting "conductor-") are excluded.
+        #
+        # Security: the message still passed the auth gate, webhook-drop check,
+        # and rate limiter above, so no boundary is weakened.
+        _a2_profile = None
+        _a2_session_title = None
+        _a2_body = None
+        _a2_conductor_name = None
+        for _a2_c in discover_conductors():
+            _a2_prof = _a2_c.get("profile") or "default"
+            _a2_sess_list = get_sessions_list(_a2_prof)
+            _a2_matched_title, _a2_matched_body = parse_session_reply_prefix(text, _a2_sess_list)
+            if _a2_matched_title:
+                _a2_session_title = _a2_matched_title
+                _a2_body = _a2_matched_body
+                _a2_profile = _a2_prof
+                _a2_conductor_name = _a2_c.get("name", "")
+                break
+
+        if _a2_session_title and _a2_body:
+            log.info(
+                "A2: routing MM reply from %s directly to session %s",
+                sender_id, _a2_session_title,
+            )
+            _a2_loop = asyncio.get_running_loop()
+            _a2_ok, _a2_response, _ = await _a2_loop.run_in_executor(
+                None,
+                functools.partial(
+                    send_to_conductor,
+                    _a2_session_title,
+                    _a2_body,
+                    profile=_a2_profile,
+                    wait_for_reply=True,
+                    response_timeout=RESPONSE_TIMEOUT,
+                ),
+            )
+            if _a2_ok and _a2_response:
+                for _chunk in split_message(_a2_response, max_len=MATTERMOST_MAX_LENGTH):
+                    await _mm_post(_chunk)
+                if _a2_conductor_name:
+                    mark_auto_response(_a2_conductor_name)
+            else:
+                await _mm_post(
+                    f"[Failed to route reply to session {_a2_session_title} - "
+                    f"check that the session is still active]"
+                )
             return
 
         # Strip conductor prefix BEFORE the verb gate so that multi-conductor
@@ -3500,10 +3641,17 @@ async def heartbeat_loop(
     interval_seconds = global_interval * 60
     tg_user_id = config["telegram"]["user_id"] if config["telegram"]["configured"] else None
 
-    # Per-conductor NEED: dedup state for issue #971 — tracks consecutive
+    # Per-conductor NEED: dedup state for issue #971 - tracks consecutive
     # identical NEED lines so we can escalate-once-then-drop instead of
     # firing the same alert verbatim for 12+ hours.
     need_state_by_conductor: dict[str, dict] = {}
+
+    # A1 (#979): per-session last-posted output hash, so we only post a
+    # waiting question once per unique question text (not every heartbeat).
+    question_hash_by_session: dict[str, str] = {}  # title -> short sha256
+
+    # Stall detection (#979): per-session {hash, since_monotonic, alerted}.
+    stall_state_by_session: dict[str, dict] = {}
 
     log.info("Heartbeat loop started (global interval: %d minutes)", global_interval)
 
@@ -3546,12 +3694,99 @@ async def heartbeat_loop(
                 )
 
                 # Only trigger conductor if there are waiting or error sessions
-                if waiting == 0 and error == 0:
+                # A1 (#979): for every waiting session, read its pending question
+                # text and post directly to MM (bypassing the conductor).
+                # De-dup: only post when the output hash has changed since the
+                # last cycle, so Liam is not flooded with identical re-posts.
+                _hb_loop = asyncio.get_running_loop()
+                for _s in scoped_sessions:
+                    if _s.get("status") != "waiting":
+                        continue
+                    _s_title = _s.get("title", "untitled")
+                    _s_path = _s.get("path", "")
+                    try:
+                        _q_text = await _hb_loop.run_in_executor(
+                            None,
+                            functools.partial(get_session_output, _s_title, profile=profile),
+                        )
+                    except Exception as _e:
+                        log.warning("A1: could not read output for waiting session %s: %s", _s_title, _e)
+                        continue
+                    if not _q_text:
+                        continue
+                    _q_hash = _output_hash(_q_text)
+                    if question_hash_by_session.get(_s_title) == _q_hash:
+                        log.debug("A1: skipping repeat question for %s (hash unchanged)", _s_title)
+                        continue
+                    question_hash_by_session[_s_title] = _q_hash
+                    _snippet = _q_text[-800:].strip() if len(_q_text) > 800 else _q_text
+                    _q_msg = (
+                        f"[QUESTION] Session **{_s_title}** is waiting for input"
+                        f"{f' (project: {_s_path})' if _s_path else ''}:\n\n{_snippet}"
+                        f"\n\nTo reply: `{_s_title}: <your answer>`"
+                    )
+                    if mm_post_fn:
+                        try:
+                            await mm_post_fn(_q_msg)
+                            mark_session_escalated(name, _s_title)
+                            log.info("A1: posted question for waiting session %s to MM", _s_title)
+                        except Exception as _e:
+                            log.error("A1: failed to post question for %s to MM: %s", _s_title, _e)
+
+                # Stall detection (#979): flag a running session as STALLED when
+                # its output hash has not changed for STALL_MINUTES_DEFAULT minutes.
+                # Alert fires once per stall period (alerted flag prevents re-spam).
+                _now_mono = time.monotonic()
+                for _s in scoped_sessions:
+                    if _s.get("status") != "running":
+                        # Reset stall tracking when a session leaves running state.
+                        stall_state_by_session.pop(_s.get("title", ""), None)
+                        continue
+                    _s_title = _s.get("title", "untitled")
+                    try:
+                        _out = await _hb_loop.run_in_executor(
+                            None,
+                            functools.partial(get_session_output, _s_title, profile=profile),
+                        )
+                    except Exception:
+                        continue
+                    _out_hash = _output_hash(_out) if _out else "empty"
+                    _prev = stall_state_by_session.get(_s_title, {})
+                    if _prev.get("hash") != _out_hash:
+                        # Output changed: reset the stall clock.
+                        stall_state_by_session[_s_title] = {
+                            "hash": _out_hash,
+                            "since": _now_mono,
+                            "alerted": False,
+                        }
+                    else:
+                        _elapsed_min = (_now_mono - _prev.get("since", _now_mono)) / 60.0
+                        if _elapsed_min >= STALL_MINUTES_DEFAULT and not _prev.get("alerted"):
+                            _stall_msg = (
+                                f"[STALL] Session **{_s_title}** has been running "
+                                f"with no output change for {int(_elapsed_min)} minutes."
+                            )
+                            if mm_post_fn:
+                                try:
+                                    await mm_post_fn(_stall_msg)
+                                    stall_state_by_session[_s_title]["alerted"] = True
+                                    mark_session_escalated(name, _s_title)
+                                    log.info(
+                                        "Stall alert posted for session %s (%d min)",
+                                        _s_title, int(_elapsed_min),
+                                    )
+                                except Exception as _e:
+                                    log.error("Failed to post stall alert for %s: %s", _s_title, _e)
+
+                # Only trigger the conductor heartbeat when there are sessions
+                # that need attention (waiting, error, or stopped).
+                if waiting == 0 and error == 0 and stopped == 0:
                     continue
 
-                # Build heartbeat message with waiting/error session details
+                # Build heartbeat message with waiting/error/stopped session details
                 waiting_details = []
                 error_details = []
+                stopped_details = []
                 for s in scoped_sessions:
                     s_title = s.get("title", "untitled")
                     s_status = s.get("status", "")
@@ -3560,6 +3795,8 @@ async def heartbeat_loop(
                         waiting_details.append(f"{s_title} (project: {s_path})")
                     elif s_status == "error":
                         error_details.append(f"{s_title} (project: {s_path})")
+                    elif s_status == "stopped":
+                        stopped_details.append(f"{s_title} (project: {s_path})")
 
                 parts = [
                     f"[HEARTBEAT] [{name}] Status: {waiting} waiting, "
@@ -3569,6 +3806,8 @@ async def heartbeat_loop(
                     parts.append(f"Waiting sessions: {', '.join(waiting_details)}.")
                 if error_details:
                     parts.append(f"Error sessions: {', '.join(error_details)}.")
+                if stopped_details:
+                    parts.append(f"Stopped sessions: {', '.join(stopped_details)}.")
                 # Append HEARTBEAT_RULES.md (per-conductor, per-profile, then global fallback)
                 rules_text = None
                 for rules_path in [
@@ -3619,7 +3858,7 @@ async def heartbeat_loop(
                     )
                     continue
 
-                # Check if conductor is busy — skip heartbeat if so
+                # Check if conductor is busy - skip heartbeat if so
                 # (heartbeats are periodic; no point queueing them)
                 loop = asyncio.get_running_loop()
                 conductor_status = await loop.run_in_executor(
@@ -3633,7 +3872,7 @@ async def heartbeat_loop(
                     )
                     continue
 
-                # Send heartbeat to conductor (wrapped in executor — blocks up to
+                # Send heartbeat to conductor (wrapped in executor - blocks up to
                 # RESPONSE_TIMEOUT seconds and must not freeze the event loop)
                 ok, response, _ = await loop.run_in_executor(
                     None,
