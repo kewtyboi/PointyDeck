@@ -38,8 +38,15 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
-    <!-- Don't run when system resources are low -->
+    <!-- Removed LowPriorityIO throttling: IOPOL_THROTTLE delays subprocess
+         spawns (50-200ms each) under any disk pressure. The bridge spawns
+         agent-deck subprocesses on every message path. -->
     <key>LowPriorityIO</key>
-    <true/>
+    <false/>
+
+    <!-- Interactive gives the bridge the highest background QoS and prevents
+         App Nap from throttling it when no visible window is present. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
 </dict>
 </plist>
