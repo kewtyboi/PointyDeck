@@ -18,12 +18,10 @@ from pathlib import Path
 
 import pytest
 
-# Canonical bridge source lives at internal/session/conductor_bridge.py
-# (embedded into the binary); there is no conductor/bridge.py in the repo.
+# Canonical bridge source lives at conductor/conductor_bridge.py
+# (embedded into the binary via conductor/conductor_bridge_embed.go).
 BRIDGE_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "internal"
-    / "session"
+    Path(__file__).resolve().parents[1]
     / "conductor_bridge.py"
 )
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	conductorpkg "github.com/asheshgoplani/agent-deck/conductor"
 	"github.com/asheshgoplani/agent-deck/internal/platform"
 )
 
@@ -1639,7 +1640,7 @@ func InstallBridgeScript() error {
 	}
 
 	bridgePath := filepath.Join(dir, "bridge.py")
-	if err := os.WriteFile(bridgePath, []byte(conductorBridgePy), 0o755); err != nil {
+	if err := os.WriteFile(bridgePath, []byte(conductorpkg.ConductorBridgePy), 0o755); err != nil {
 		return fmt.Errorf("failed to write bridge.py: %w", err)
 	}
 

@@ -1,4 +1,4 @@
-package session
+package conductor
 
 import (
 	"os"
@@ -10,7 +10,7 @@ import (
 )
 
 // canonicalBridgePath returns the path to the one canonical bridge source,
-// internal/session/conductor_bridge.py, relative to this test file.
+// conductor/conductor_bridge.py, relative to this test file.
 func canonicalBridgePath(t *testing.T) string {
 	t.Helper()
 	_, thisFile, _, ok := runtime.Caller(0)
@@ -20,9 +20,31 @@ func canonicalBridgePath(t *testing.T) string {
 	return filepath.Join(filepath.Dir(thisFile), "conductor_bridge.py")
 }
 
+// findPython3 locates a python3 interpreter. Prefers PATH resolution, then
+// falls back to well-known installation paths. (The full session.findPython3
+// also checks a conductor venv; that is not needed for embed smoke tests.)
+func findPython3() string {
+	if p, err := exec.LookPath("python3"); err == nil {
+		if abs, err := filepath.Abs(p); err == nil {
+			return abs
+		}
+		return p
+	}
+	for _, p := range []string{
+		"/opt/homebrew/bin/python3",
+		"/usr/local/bin/python3",
+		"/usr/bin/python3",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 // TestEmbeddedBridgeMatchesCanonical asserts the embedded bytes equal the
 // canonical on-disk file. There is exactly one canonical bridge.py in the repo
-// (internal/session/conductor_bridge.py); go:embed pulls it in directly, so
+// (conductor/conductor_bridge.py); go:embed pulls it in directly, so
 // this is mostly insurance against build-cache weirdness. The maintainer
 // explicitly asked for it. If it ever fails, the embedded var and the file have
 // somehow diverged within a build.
@@ -31,8 +53,8 @@ func TestEmbeddedBridgeMatchesCanonical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read canonical conductor_bridge.py: %v", err)
 	}
-	if conductorBridgePy != string(canonical) {
-		t.Errorf("embedded conductorBridgePy differs from internal/session/conductor_bridge.py " +
+	if ConductorBridgePy != string(canonical) {
+		t.Errorf("embedded ConductorBridgePy differs from conductor/conductor_bridge.py " +
 			"(the single canonical source); the go:embed bytes and the on-disk file disagree")
 	}
 }
@@ -46,7 +68,7 @@ func TestEmbeddedBridgeParsesAsPython(t *testing.T) {
 		t.Skip("python3 not found; cannot syntax-check embedded bridge")
 	}
 	cmd := exec.Command(py, "-c", "import ast,sys; ast.parse(sys.stdin.read())")
-	cmd.Stdin = strings.NewReader(conductorBridgePy)
+	cmd.Stdin = strings.NewReader(ConductorBridgePy)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("embedded bridge.py does not parse as Python: %v\n%s", err, out)
 	}
@@ -55,7 +77,7 @@ func TestEmbeddedBridgeParsesAsPython(t *testing.T) {
 // TestEmbeddedBridgeResolvesSecret verifies the deployed bridge carries the
 // #1386 env-var secret resolution (one half of the union). It imports the
 // embedded bytes as a module and checks _resolve_secret("$VAR") reads os.environ
-// — the behavior that lets config.toml reference $TELEGRAM_BOT_TOKEN etc. — and
+// - the behavior that lets config.toml reference $TELEGRAM_BOT_TOKEN etc. - and
 // that the #452 _drain_queue ships in the SAME file (both halves of the union).
 func TestEmbeddedBridgeResolvesSecret(t *testing.T) {
 	py := findPython3()
@@ -64,7 +86,7 @@ func TestEmbeddedBridgeResolvesSecret(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "bridge.py"), []byte(conductorBridgePy), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "bridge.py"), []byte(ConductorBridgePy), 0o644); err != nil {
 		t.Fatalf("write temp bridge.py: %v", err)
 	}
 
