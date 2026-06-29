@@ -40,10 +40,10 @@ info "Creating conductor directory: ${CONDUCTOR_DIR}"
 mkdir -p "${CONDUCTOR_DIR}"
 
 # Copy bridge script to base conductor directory. The canonical source is the
-# single embedded copy at internal/session/conductor_bridge.py (see
-# conductor/README.md); the Go installer (InstallBridgeScript) materializes the
-# same bytes. This shell installer copies that canonical file directly.
-cp "${SCRIPT_DIR}/../internal/session/conductor_bridge.py" "${CONDUCTOR_DIR}/bridge.py"
+# single embedded copy at conductor/conductor_bridge.py (see conductor/README.md);
+# the Go installer (InstallBridgeScript) materializes the same bytes. This shell
+# installer copies that canonical file directly.
+cp "${SCRIPT_DIR}/conductor_bridge.py" "${CONDUCTOR_DIR}/bridge.py"
 chmod +x "${CONDUCTOR_DIR}/bridge.py"
 ok "bridge.py installed"
 

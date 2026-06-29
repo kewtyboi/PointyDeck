@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	conductorpkg "github.com/asheshgoplani/agent-deck/conductor"
 )
 
 // --- Systemd template generation tests ---
@@ -507,7 +509,7 @@ func TestDiscordSettings_TOML(t *testing.T) {
 
 func TestBridgeTemplate_ContainsSlackAuthorization(t *testing.T) {
 	// Verify that the Python bridge template contains the Slack authorization code
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 
 	// Check for authorization function definition
 	if !strings.Contains(template, "def is_slack_authorized(user_id: str) -> bool:") {
@@ -549,7 +551,7 @@ func TestBridgeTemplate_ContainsSlackAuthorization(t *testing.T) {
 
 func TestBridgeTemplate_SlackHandlersHaveAuthorization(t *testing.T) {
 	// Verify all Slack handlers have authorization checks
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 
 	handlers := []struct {
 		name    string
@@ -572,7 +574,7 @@ func TestBridgeTemplate_SlackHandlersHaveAuthorization(t *testing.T) {
 
 func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
 	// Verify the config loading includes allowed_user_ids
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 
 	configPatterns := []string{
 		`sl_allowed_users = sl.get("allowed_user_ids", [])`,
@@ -587,7 +589,7 @@ func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
 }
 
 func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 
 	patterns := []string{
 		"def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:",
@@ -605,7 +607,7 @@ func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
 }
 
 func TestBridgeTemplate_SendToConductorSupportsSingleCallWait(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	waitPattern := `"--wait", "--timeout", f"{response_timeout}s", "-q",`
 	noWaitPattern := `"session", "send", session, message, "--no-wait",`
 	oldPattern := `"session", "send", session, message, profile=profile, timeout=120`
@@ -2069,7 +2071,7 @@ func TestConductorMeta_GetClearOnCompact(t *testing.T) {
 // --- Discord bridge template tests ---
 
 func TestBridgeTemplate_ContainsDiscordBot(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	patterns := []string{
 		"HAS_DISCORD",
 		"create_discord_bot",
@@ -2084,7 +2086,7 @@ func TestBridgeTemplate_ContainsDiscordBot(t *testing.T) {
 }
 
 func TestBridgeTemplate_ContainsDiscordAuthorization(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 
 	// Check for authorization function
 	if !strings.Contains(template, "def is_authorized(user_id: int) -> bool:") {
@@ -2098,7 +2100,7 @@ func TestBridgeTemplate_ContainsDiscordAuthorization(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordConfigLoading(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	patterns := []string{
 		`dc = conductor_cfg.get("discord", {})`,
 		`dc_bot_token = _resolve_secret(dc.get("bot_token", ""))`,
@@ -2123,7 +2125,7 @@ func TestBridgeTemplate_DiscordConfigLoading(t *testing.T) {
 // env-var reference like "$TELEGRAM_USER_ID"), mirroring the bot-token style,
 // while still coercing the resolved value to int in the returned config.
 func TestBridgeTemplate_UserIDResolvedViaSecret(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	patterns := []string{
 		`tg_user_id = _resolve_secret(str(tg.get("user_id", "") or ""))`,
 		`dc_user_id = _resolve_secret(str(dc.get("user_id", "") or ""))`,
@@ -2147,7 +2149,7 @@ func TestBridgeTemplate_UserIDResolutionBehavior(t *testing.T) {
 		t.Skip("python3 not available; skipping behavioral test")
 	}
 
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	start := strings.Index(template, "def _resolve_secret")
 	end := strings.Index(template, "def load_config")
 	if start < 0 || end < 0 || end <= start {
@@ -2199,7 +2201,7 @@ print(resolve_user_id({"user_id": "$NOPE_UNSET"}))          # unset env ref -> 0
 }
 
 func TestBridgeTemplate_DiscordSlashCommands(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	commands := []string{
 		`name="ad-status"`,
 		`name="ad-sessions"`,
@@ -2214,7 +2216,7 @@ func TestBridgeTemplate_DiscordSlashCommands(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordSlashCommandsChannelRestriction(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	patterns := []string{
 		"async def ensure_discord_channel(interaction: discord.Interaction) -> bool:",
 		`if interaction.channel_id != channel_id:`,
@@ -2229,7 +2231,7 @@ func TestBridgeTemplate_DiscordSlashCommandsChannelRestriction(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordListenModeSupport(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	patterns := []string{
 		`listen_mode = str(config["discord"].get("listen_mode", "all") or "all").strip().lower()`,
 		`if listen_mode not in {"all", "mentions"}:`,
@@ -2246,7 +2248,7 @@ func TestBridgeTemplate_DiscordListenModeSupport(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordReplyFilterSupport(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	patterns := []string{
 		`ignore_replies_to_others = bool(`,
 		`config["discord"].get("ignore_replies_to_others", False)`,
@@ -2263,7 +2265,7 @@ func TestBridgeTemplate_DiscordReplyFilterSupport(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordHeartbeatNotification(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	if !strings.Contains(template, "discord_bot=None, discord_channel_id=None") {
 		t.Error("heartbeat_loop should accept discord_bot and discord_channel_id params")
 	}
@@ -2276,7 +2278,7 @@ func TestBridgeTemplate_DiscordHeartbeatNotification(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordInMain(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	patterns := []string{
 		`dc_ok = config["discord"]["configured"] and HAS_DISCORD`,
 		"create_discord_bot(config)",
@@ -2291,7 +2293,7 @@ func TestBridgeTemplate_DiscordInMain(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordTypingIndicator(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	if !strings.Contains(template, "async with message.channel.typing():") {
 		t.Error("Discord on_message should show typing indicator while waiting for conductor response")
 	}
@@ -2301,7 +2303,7 @@ func TestBridgeTemplate_DiscordTypingIndicator(t *testing.T) {
 }
 
 func TestBridgeTemplate_DiscordImageUploadSupport(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 	patterns := []string{
 		`IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(?P<path>[^\]]+)\]")`,
 		`def parse_discord_message_parts(text: str) -> list[tuple[str, str]]:`,
@@ -2428,7 +2430,7 @@ func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
 // --- Slack markdown-to-mrkdwn converter tests ---
 
 func TestBridgeTemplate_ContainsMarkdownToSlackConverter(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 
 	// Function definition must exist.
 	if !strings.Contains(template, "def _markdown_to_slack(text: str) -> str:") {
@@ -2479,7 +2481,7 @@ func TestBridgeTemplate_ContainsMarkdownToSlackConverter(t *testing.T) {
 }
 
 func TestBridgeTemplate_SafeSayConvertsMarkdown(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 
 	// _safe_say must call _markdown_to_slack.
 	if !strings.Contains(template, "_markdown_to_slack(kwargs[\"text\"])") {
@@ -2794,12 +2796,12 @@ func TestConductorMeta_InactivityPauseJSON(t *testing.T) {
 // --- Issue #1350: bridge.py XDG path resolution ---
 
 // TestBridgeTemplate_DoesNotHardcodeLegacyAgentDeckRoot guards against the
-// embedded conductorBridgePy const drifting back to the hardcoded
+// embedded conductorpkg.ConductorBridgePy const drifting back to the hardcoded
 // ~/.agent-deck roots that broke conductor routing on fresh XDG installs
 // (issue #1350). The bridge must resolve CONDUCTOR_DIR / CONFIG_PATH through
 // XDG-with-legacy-fallback resolvers that mirror internal/agentpaths.
 func TestBridgeTemplate_DoesNotHardcodeLegacyAgentDeckRoot(t *testing.T) {
-	template := conductorBridgePy
+	template := conductorpkg.ConductorBridgePy
 
 	// The old hardcoded root assignment must be gone.
 	if strings.Contains(template, `AGENT_DECK_DIR = Path.home() / ".agent-deck"`) {
@@ -2861,14 +2863,15 @@ func TestBridgeTemplate_ResolverMirrorsRealBridgeFile(t *testing.T) {
 		return src[start : start+end+len(endMarker)]
 	}
 
-	embedded := extract(conductorBridgePy, "embedded value")
+	embedded := extract(conductorpkg.ConductorBridgePy, "embedded value")
 
-	// Locate the canonical internal/session/conductor_bridge.py next to this test.
+	// Locate the canonical conductor/conductor_bridge.py relative to this test.
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	bridgePath := filepath.Join(filepath.Dir(thisFile), "conductor_bridge.py")
+	// conductor_bridge.py moved from internal/session/ to conductor/; traverse up.
+	bridgePath := filepath.Join(filepath.Dir(thisFile), "..", "..", "conductor", "conductor_bridge.py")
 	data, err := os.ReadFile(bridgePath)
 	if err != nil {
 		t.Fatalf("read %s: %v", bridgePath, err)
