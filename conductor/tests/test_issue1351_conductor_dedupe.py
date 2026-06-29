@@ -19,7 +19,7 @@ try:
 except ModuleNotFoundError:
     sys.modules["toml"] = types.SimpleNamespace(load=lambda *_args, **_kwargs: {})
 
-from bridge import ensure_conductor_running  # noqa: E402
+from bridge import ensure_conductor_running, CONDUCTOR_DIR  # noqa: E402
 
 
 async def _no_sleep(_seconds: float) -> None:
@@ -77,7 +77,7 @@ def test_fresh_setup_creates_session_then_starts_it():
     commands = [call.args[:3] for call in mock_cli.call_args_list]
     assert commands == [
         ("session", "start", "conductor-ops"),
-        ("add", str(Path.home() / ".agent-deck" / "conductor" / "ops"), "-t"),
+        ("add", str(CONDUCTOR_DIR / "ops"), "-t"),
         ("session", "start", "conductor-ops"),
     ]
     assert len(_calls_for(mock_cli, "add")) == 1

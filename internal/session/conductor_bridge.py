@@ -640,6 +640,25 @@ MAX_QUEUE_DEPTH = 20
 # when the queued message is eventually delivered.
 _message_queue: dict[str, deque[tuple[str, str | None, ReplyCallback | None]]] = {}
 _drain_task: asyncio.Task | None = None
+# Event used to wake _drain_queue immediately when a message is enqueued,
+# instead of waiting for the full 5-second fallback poll.
+_drain_event: asyncio.Event | None = None
+
+
+def _get_drain_event() -> asyncio.Event | None:
+    """Return (and lazily create) the drain wake event.
+
+    Returns None when no event loop is running, which is safe for sync
+    callers - they fall back to the 5-second timeout in _drain_queue.
+    """
+    global _drain_event
+    if _drain_event is None:
+        try:
+            asyncio.get_running_loop()
+            _drain_event = asyncio.Event()
+        except RuntimeError:
+            return None
+    return _drain_event
 
 
 def _enqueue_message(
@@ -674,6 +693,10 @@ def _enqueue_message(
                 pass  # no event loop available, can't fire async callback
     queue.append((message, profile, reply_callback))
     log.info("Queued message for %s (queue depth: %d)", session, len(queue))
+    # Wake the drain task immediately instead of waiting for the 5s poll.
+    ev = _get_drain_event()
+    if ev is not None:
+        ev.set()
     _ensure_drain_task()
 
 
@@ -720,13 +743,21 @@ async def _drain_queue_supervised() -> None:
 async def _drain_queue() -> None:
     """Background loop that delivers queued messages once conductors are ready.
 
-    Polls every 5s. For each conductor with queued messages, checks its
-    status and delivers the oldest message when it becomes idle/waiting.
+    Wakes immediately when _get_drain_event().set() is called by _enqueue_message,
+    with a 5-second fallback poll to catch any race conditions.
     Stops when the queue is empty.
     """
     log.info("Queue drain task started")
     while True:
-        await asyncio.sleep(5)
+        ev = _get_drain_event()
+        if ev is None:
+            await asyncio.sleep(5)
+        else:
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            ev.clear()
 
         # Snapshot keys to avoid mutation during iteration
         sessions = list(_message_queue.keys())
@@ -1063,6 +1094,35 @@ async def ensure_conductor_running(name: str, profile: str) -> bool:
         return final_status not in ("error", "unknown")
 
     return True
+
+
+async def ensure_conductor_running_with_status(
+    name: str, profile: str
+) -> tuple[bool, str]:
+    """Like ensure_conductor_running but also returns the final session status.
+
+    Returns (ok, status_str) so the caller can derive was_busy without a
+    second get_session_status subprocess call (H1 fix: eliminate duplicate).
+    On the happy path (conductor already running) this saves one subprocess
+    spawn (50-200ms). Falls back to ensure_conductor_running for start-up.
+    """
+    session_title = conductor_session_title(name)
+    loop = asyncio.get_running_loop()
+    status = await loop.run_in_executor(
+        None, functools.partial(get_session_status, session_title, profile=profile)
+    )
+
+    if status not in ("waiting", "running", "idle", "active", "starting"):
+        # Delegate start-up to the existing function then re-fetch status.
+        ok = await ensure_conductor_running(name, profile)
+        if not ok:
+            return False, "error"
+        status = await loop.run_in_executor(
+            None, functools.partial(get_session_status, session_title, profile=profile)
+        )
+        return status not in ("error", "unknown"), status
+
+    return True, status
 
 
 # ---------------------------------------------------------------------------
@@ -2798,12 +2858,17 @@ def create_mattermost_bridge(config: dict):
         session_title = conductor_session_title(target["name"])
         profile = target["profile"]
 
-        # Run pre-message hook (can transform or gate the message)
-        hook_result = invoke_hook(profile, "pre-message", {
-            "profile": profile,
-            "message_text": cleaned_msg,
-            "user_id": sender_id,
-        })
+        # Run pre-message hook off the event loop via run_in_executor to avoid
+        # blocking the asyncio thread for up to DEFAULT_HOOK_TIMEOUT (30s).
+        loop = asyncio.get_running_loop()
+        hook_result = await loop.run_in_executor(
+            None,
+            functools.partial(invoke_hook, profile, "pre-message", {
+                "profile": profile,
+                "message_text": cleaned_msg,
+                "user_id": sender_id,
+            }),
+        )
         if hook_result is not None:
             success, stdout = hook_result
             if not success:
@@ -2812,14 +2877,15 @@ def create_mattermost_bridge(config: dict):
             if stdout:
                 cleaned_msg = stdout
 
-        if not await ensure_conductor_running(target["name"], profile):
+        # ensure_conductor_running_with_status returns the status so we avoid
+        # a duplicate get_session_status subprocess call (H1 fix).
+        ok, conductor_status = await ensure_conductor_running_with_status(
+            target["name"], profile
+        )
+        if not ok:
             await _mm_post(f"[Could not start conductor {target['name']}. Check agent-deck.]")
             return
 
-        loop = asyncio.get_running_loop()
-        conductor_status = await loop.run_in_executor(
-            None, functools.partial(get_session_status, session_title, profile=profile)
-        )
         was_busy = conductor_status in ("running", "active", "starting")
         name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
 
@@ -2880,11 +2946,15 @@ def create_mattermost_bridge(config: dict):
             prefixed = f"{name_tag}{chunk}" if name_tag else chunk
             await _mm_post(prefixed)
 
-        invoke_hook(profile, "post-message", {
-            "profile": profile,
-            "message_text": cleaned_msg,
-            "response": response,
-        })
+        # Run post-message hook off the event loop (non-gating, fire-and-forget).
+        loop.run_in_executor(
+            None,
+            functools.partial(invoke_hook, profile, "post-message", {
+                "profile": profile,
+                "message_text": cleaned_msg,
+                "response": response,
+            }),
+        )
 
     async def _ensure_own_user_id() -> None:
         """Fetch and cache the bot's own user_id for self-post filtering.
