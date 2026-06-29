@@ -23,11 +23,13 @@ import asyncio
 import functools
 import json
 import logging
+import math
 import os
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -187,6 +189,326 @@ def mattermost_is_authorized(
         "denies all inbound input). Set allowed_user_ids to enable."
     )
     return False
+
+
+# ---------------------------------------------------------------------------
+# I5: Dev escape-hatch hardening
+# ---------------------------------------------------------------------------
+
+_AGENTBRIDGE_DEV_FLAG = "AGENTBRIDGE_DEV"
+
+
+def resolve_allow_all_dev(config_value: bool) -> bool:
+    """Harden the dev escape hatch (I5 / AUTH4).
+
+    ``allow_all_users_for_dev=true`` in config is ONLY honoured when the
+    explicit environment variable ``AGENTBRIDGE_DEV=1`` is also set.
+
+    If the config flag is set but the env is absent the bypass is silently
+    denied and a loud WARNING is emitted so operators notice the mismatch.
+    If both are set a CRITICAL-level alert fires to make dev mode impossible
+    to miss in production logs.
+    """
+    if not config_value:
+        return False
+    env_set = os.environ.get(_AGENTBRIDGE_DEV_FLAG, "").strip() == "1"
+    if not env_set:
+        log.warning(
+            "SECURITY: allow_all_users_for_dev=true found in config but %s=1 is NOT "
+            "set in the process environment. The dev bypass is DENIED. "
+            "This setting is ignored without the env flag. "
+            "Remove allow_all_users_for_dev from config for production use.",
+            _AGENTBRIDGE_DEV_FLAG,
+        )
+        return False
+    log.critical(
+        "SECURITY WARNING: AGENTBRIDGE DEV MODE ACTIVE. "
+        "allow_all_users_for_dev=true AND %s=1 are both set. "
+        "ALL inbound senders accepted. NEVER use this in production.",
+        _AGENTBRIDGE_DEV_FLAG,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# I1: Webhook / bot post rejection
+# ---------------------------------------------------------------------------
+
+
+def mm_should_drop_webhook(
+    post: dict,
+    allowed_webhook_ids: list[str] | None = None,
+) -> bool:
+    """Return True if the post should be dropped because it is from a webhook or bot.
+
+    Posts whose ``props`` carry ``from_webhook="true"`` or a truthy ``from_bot``
+    field are dropped unless the sender_id appears in the explicit allow-list
+    (env ``AGENTBRIDGE_WEBHOOK_ALLOW``, comma-separated, or the parameter).
+
+    Closes AUTH3: a leaked webhook URL cannot inject commands because the
+    bridge rejects webhook-origin posts at the gate, even when the embedded
+    user_id would otherwise pass Boundary 1.
+    """
+    props = post.get("props") or {}
+    is_webhook = props.get("from_webhook") == "true"
+    is_bot = bool(props.get("from_bot"))
+    if not (is_webhook or is_bot):
+        return False
+
+    sender_id = post.get("user_id", "")
+
+    if allowed_webhook_ids is None:
+        env_val = os.environ.get("AGENTBRIDGE_WEBHOOK_ALLOW", "").strip()
+        allowed_webhook_ids = [x.strip() for x in env_val.split(",") if x.strip()] if env_val else []
+
+    if sender_id in allowed_webhook_ids:
+        log.info(
+            "Mattermost: webhook/bot post from allow-listed sender %s; accepting",
+            sender_id,
+        )
+        return False
+
+    log.warning(
+        "Mattermost: dropping post from webhook/bot "
+        "(from_webhook=%s from_bot=%s sender=%s). "
+        "Set AGENTBRIDGE_WEBHOOK_ALLOW to allow specific senders.",
+        is_webhook,
+        is_bot,
+        sender_id,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# C2: Command grammar / intent gate
+# ---------------------------------------------------------------------------
+
+# Default verb allow-list (configurable via AGENTBRIDGE_ALLOWED_VERBS env var).
+# Only the first whitespace-delimited token of the inbound message is checked.
+_MM_DEFAULT_ALLOWED_VERBS: frozenset[str] = frozenset({
+    "status", "review", "land", "rebase", "run", "check", "list",
+    "help", "go", "plan", "brainstorm", "apex", "cancel", "retry",
+    "build", "test", "deploy", "merge", "logs", "restart", "stop",
+    "start", "continue", "report", "debug", "fix",
+})
+
+
+def classify_message(
+    text: str,
+    allowed_verbs: frozenset[str] | None = None,
+) -> tuple[str | None, str | None]:
+    """Classify an inbound message as a recognised command intent or refuse it (C2).
+
+    Returns ``(intent, None)`` when the message is allowed to proceed.
+    Returns ``(None, refusal_reply)`` when the message is refused.
+
+    The first whitespace-delimited token (lower-cased) is the verb.  Only
+    tokens present in ``allowed_verbs`` (or the env-configured / default set)
+    are accepted.  Everything else is refused with a human-readable help reply.
+
+    Configuration
+    -------------
+    ``AGENTBRIDGE_ALLOWED_VERBS`` env var: comma-separated list that completely
+    overrides the default set for this process.
+    ``allowed_verbs`` parameter: per-call override (useful for tests and
+    per-bridge config without touching the environment).
+    """
+    if allowed_verbs is None:
+        env_verbs = os.environ.get("AGENTBRIDGE_ALLOWED_VERBS", "").strip()
+        if env_verbs:
+            allowed_verbs = frozenset(v.strip().lower() for v in env_verbs.split(",") if v.strip())
+        else:
+            allowed_verbs = _MM_DEFAULT_ALLOWED_VERBS
+
+    tokens = text.split()
+    verb = tokens[0].lower() if tokens else ""
+
+    if verb in allowed_verbs:
+        return verb, None
+
+    log.warning(
+        "Mattermost: message refused by command grammar gate (verb=%r not in allow-list). "
+        "Set AGENTBRIDGE_ALLOWED_VERBS to customise. Message dropped.",
+        verb,
+    )
+    known_sorted = sorted(allowed_verbs)
+    shown = known_sorted[:12]
+    ellipsis = "..." if len(known_sorted) > 12 else ""
+    reply = (
+        f"[Unrecognised command verb: {verb!r}. "
+        f"Allowed: {', '.join(shown)}{ellipsis}]\n"
+        "Use one of the recognised verbs, or ask the operator to extend "
+        "AGENTBRIDGE_ALLOWED_VERBS."
+    )
+    return None, reply
+
+
+# ---------------------------------------------------------------------------
+# C3: Egress secret scan
+# ---------------------------------------------------------------------------
+
+# Compiled patterns for secrets likely to appear in agent replies.
+# Ordered from most-specific (low false-positive) to broadest.
+_SECRET_PATTERNS: list[re.Pattern] = [
+    # PEM private-key / certificate headers
+    re.compile(r"-----BEGIN [A-Z ]+-----"),
+    # AWS access key IDs
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # GitHub tokens (classic and fine-grained variants)
+    re.compile(r"\bghp_[0-9a-zA-Z]{36}\b"),
+    re.compile(r"\bgho_[0-9a-zA-Z]{36}\b"),
+    re.compile(r"\bghs_[0-9a-zA-Z]{36}\b"),
+    re.compile(r"\bghr_[0-9a-zA-Z]{36}\b"),
+    re.compile(r"\bgh[ufp]_[0-9a-zA-Z]{76}\b"),
+    # Slack tokens
+    re.compile(r"\bxox[baprs]-[0-9a-zA-Z-]{10,}"),
+    # JWT tokens (header.payload.signature)
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    # Generic key=value patterns where value looks like a secret
+    re.compile(
+        r"(?i)\b(password|secret|token|api_key|apikey|access_key|private_key)"
+        r"\s*[:=]\s*[A-Za-z0-9+/=_-]{16,}"
+    ),
+    # High-entropy base64-ish strings (>= 44 chars, Shannon entropy >= 4.5 bits/char).
+    # Applied last to minimise false positives on long but low-entropy strings.
+    re.compile(r"[A-Za-z0-9+/]{44,}={0,2}"),
+]
+
+_REDACT_PLACEHOLDER = "[REDACTED]"
+
+
+def _shannon_entropy(s: str) -> float:
+    """Return the Shannon entropy (bits per character) of string ``s``."""
+    if not s:
+        return 0.0
+    freq: dict[str, int] = {}
+    for c in s:
+        freq[c] = freq.get(c, 0) + 1
+    n = len(s)
+    return -sum((f / n) * math.log2(f / n) for f in freq.values())
+
+
+def scan_and_redact_secrets(text: str) -> tuple[str, bool]:
+    """Scan ``text`` for secret patterns and redact all matches (C3).
+
+    Returns ``(clean_text, was_redacted)``.
+    Fail-closed: any match causes the matched region to be replaced with
+    ``[REDACTED]``.  Operates on the whole string so multi-line outputs are
+    covered.
+
+    The high-entropy base64 pattern requires entropy >= 4.5 bits/char to
+    reduce false positives on long but low-entropy strings such as URLs.
+    """
+    redacted = False
+    result = text
+
+    for pattern in _SECRET_PATTERNS:
+        if pattern is _SECRET_PATTERNS[-1]:
+            # High-entropy guard: only redact if entropy threshold is met.
+            def _redact_high_entropy(m: re.Match) -> str:
+                matched = m.group(0)
+                if _shannon_entropy(matched) >= 4.5:
+                    return _REDACT_PLACEHOLDER
+                return matched
+            new_result = pattern.sub(_redact_high_entropy, result)
+        else:
+            new_result = pattern.sub(_REDACT_PLACEHOLDER, result)
+
+        if new_result != result:
+            redacted = True
+            result = new_result
+
+    return result, redacted
+
+
+# ---------------------------------------------------------------------------
+# M1: Append-only audit log
+# ---------------------------------------------------------------------------
+
+_MM_AUDIT_LOG_ENV = "AGENTBRIDGE_AUDIT_LOG"
+
+
+def mm_write_audit(
+    sender_id: str,
+    intent: str,
+    channel: str,
+    target_name: str,
+    audit_path: str | None = None,
+) -> None:
+    """Append a structured audit record for every accepted inbound message (M1).
+
+    Format: newline-delimited JSON (one record per line), append-only.
+    The file is created on first write.  I/O errors are logged as warnings
+    rather than surfaced to callers so a broken audit path cannot block
+    legitimate traffic (though the operator will see the warning).
+
+    Configuration
+    -------------
+    ``AGENTBRIDGE_AUDIT_LOG`` env var: absolute path to the audit log file.
+    ``audit_path`` parameter: per-call override (tests / per-bridge config).
+    If neither is set the file is written to the agent-deck data directory as
+    ``conductor/mm_audit.jsonl``.
+    """
+    path = audit_path or os.environ.get(_MM_AUDIT_LOG_ENV, "").strip()
+    if not path:
+        try:
+            path = str(resolve_data_dir("conductor") / "mm_audit.jsonl")
+        except Exception:
+            path = os.path.join(os.path.expanduser("~"), ".agent-deck", "conductor", "mm_audit.jsonl")
+
+    record = json.dumps({
+        "ts": _now_iso(),
+        "sender_id": sender_id,
+        "intent": intent,
+        "channel": channel,
+        "target": target_name,
+    }, separators=(",", ":"))
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(record + "\n")
+    except Exception as exc:
+        log.warning("Mattermost: could not write audit record to %s: %s", path, exc)
+
+
+# ---------------------------------------------------------------------------
+# M2: Per-sender token-bucket rate limiter
+# ---------------------------------------------------------------------------
+
+
+class MmRateLimiter:
+    """Per-sender token-bucket rate limiter for inbound Mattermost messages (M2).
+
+    Each sender gets an independent bucket.  Buckets are lazily initialised.
+    Thread-safe via a lock (safe to call from both sync and async contexts).
+
+    Parameters
+    ----------
+    max_tokens:
+        Burst capacity per sender bucket.
+    refill_rate:
+        Tokens added per second (e.g. ``10 / 60`` = ten messages per minute).
+    """
+
+    def __init__(self, max_tokens: int = 10, refill_rate: float = 10.0 / 60.0) -> None:
+        self._max = float(max_tokens)
+        self._rate = refill_rate
+        # sender_id -> (tokens_remaining, last_refill_monotonic)
+        self._buckets: dict[str, tuple[float, float]] = {}
+        self._lock = threading.Lock()
+
+    def is_allowed(self, sender_id: str) -> bool:
+        """Attempt to consume one token.  Returns True if allowed, False if throttled."""
+        now = time.monotonic()
+        with self._lock:
+            tokens, last_ts = self._buckets.get(sender_id, (self._max, now))
+            elapsed = now - last_ts
+            tokens = min(self._max, tokens + elapsed * self._rate)
+            if tokens < 1.0:
+                self._buckets[sender_id] = (tokens, now)
+                return False
+            self._buckets[sender_id] = (tokens - 1.0, now)
+            return True
+
 
 # Telegram message length limit
 TG_MAX_LENGTH = 4096
@@ -2743,7 +3065,19 @@ def create_mattermost_bridge(config: dict):
     token = mm_cfg["token"]
     channel_id = mm_cfg["channel_id"]
     allowed_users = mm_cfg["allowed_user_ids"]
-    allow_all_dev = mm_cfg.get("allow_all_users_for_dev", False)
+    # I5: dev escape hatch is only honoured when AGENTBRIDGE_DEV=1 is set in env.
+    allow_all_dev = resolve_allow_all_dev(mm_cfg.get("allow_all_users_for_dev", False))
+    # C2: per-bridge verb allow-list (list[str] in config, or None to use env/default).
+    _raw_verbs = mm_cfg.get("allowed_verbs")
+    mm_allowed_verbs: frozenset[str] | None = (
+        frozenset(v.strip().lower() for v in _raw_verbs if v.strip())
+        if isinstance(_raw_verbs, list) else None
+    )
+    # M2: per-sender rate limiter (config keys: rate_limit_max, rate_limit_per_minute).
+    _mm_rate_limiter = MmRateLimiter(
+        max_tokens=int(mm_cfg.get("rate_limit_max", 10)),
+        refill_rate=float(mm_cfg.get("rate_limit_per_minute", 10)) / 60.0,
+    )
 
     # Mutable health snapshot persisted to MATTERMOST_STATUS_PATH on changes.
     mm_status = {
@@ -2777,10 +3111,23 @@ def create_mattermost_bridge(config: dict):
         return mattermost_is_authorized(user_id, allowed_users, allow_all_dev)
 
     async def _mm_post(text: str) -> None:
-        """Post a message to the configured Mattermost channel, splitting if needed."""
+        """Post a message to the configured Mattermost channel, splitting if needed.
+
+        C3: Every outbound chunk is scanned for secrets before being sent.
+        Matched patterns are redacted in-place (fail-closed: redact on hit).
+        """
         for chunk in split_message(text, max_len=MATTERMOST_MAX_LENGTH):
+            # C3: Egress secret scan - redact before posting.
+            clean_chunk, was_redacted = scan_and_redact_secrets(chunk)
+            if was_redacted:
+                log.warning(
+                    "Mattermost: egress secret detected and redacted in outbound reply "
+                    "(original_len=%d clean_len=%d). Possible data-exfiltration attempt.",
+                    len(chunk),
+                    len(clean_chunk),
+                )
             try:
-                await driver.posts.create_post(channel_id=channel_id, message=chunk)
+                await driver.posts.create_post(channel_id=channel_id, message=clean_chunk)
             except Exception as exc:
                 log.error("Mattermost post failed: %s", exc)
 
@@ -2830,11 +3177,48 @@ def create_mattermost_bridge(config: dict):
         if not is_mm_authorized(sender_id):
             return
 
+        # I1: Reject webhook / bot-origin posts (closes AUTH3).
+        # Even if the embedded user_id is allow-listed, a webhook post is
+        # structurally different from an interactive message -- a leaked
+        # webhook URL would otherwise bypass Boundary 1 entirely.
+        if mm_should_drop_webhook(post):
+            return
+
         text = post.get("message", "").strip()
         if not text:
             return
 
-        log.info("Mattermost message from %s (%d chars)", sender_id, len(text))
+        # M2: Per-sender rate limit (token bucket).
+        if not _mm_rate_limiter.is_allowed(sender_id):
+            log.warning(
+                "Mattermost: rate limit exceeded for sender %s; message dropped",
+                sender_id,
+            )
+            return
+
+        # C2: Command grammar / intent gate.
+        # Free-form text is refused on the privileged conductor path.
+        # Only messages whose first token matches the allow-list proceed.
+        intent, refusal_reply = classify_message(text, allowed_verbs=mm_allowed_verbs)
+        if intent is None:
+            if refusal_reply:
+                asyncio.get_running_loop().create_task(_mm_post(refusal_reply))
+            return
+
+        # M1: Audit log -- only accepted (post-gate) messages are recorded.
+        mm_write_audit(
+            sender_id=sender_id,
+            intent=intent,
+            channel=channel_id,
+            target_name="(pending)",
+        )
+
+        log.info(
+            "Mattermost message from %s intent=%r (%d chars)",
+            sender_id,
+            intent,
+            len(text),
+        )
 
         conductor_names = get_conductor_names()
         conductors = discover_conductors()
